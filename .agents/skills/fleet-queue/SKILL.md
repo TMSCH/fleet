@@ -351,7 +351,13 @@ into its worktree, so nothing lands in its pull request.
 
 If a spawn fails, the others still go. Re-run `dispatch`; the ones already out
 are not spawned twice. A session you spawned by hand for a task is bound to it
-with `fleet queue attach`.
+with `fleet queue attach`. One whose agent reports working, blocked or done is
+recorded prompted, so the bare `prompt` sweep never types the brief into work
+in progress. Idle can mean a fresh session, so it stays unprompted by default;
+`attach --prompted` confirms it already has its work, and `attach --unprompted`
+forces a session to receive the brief regardless of its state.
+Any delivered `send`, and a refuel restart that was briefed, marks a task
+prompted the same way.
 
 ### Naming refs, and the one thing they are for
 
@@ -903,11 +909,13 @@ is also a setting: `<NAME>_SECS` in the gitignored
 restart` after an edit), with `FLEET_RECONCILE_<NAME>_SECS` still beating it.
 Two things are about you:
 
-- **It will type one line at you, and only ever about three things:** that N
+- **It will type one line at you, and only ever about four things:** that N
   tasks are ready and nothing will dispatch them — treat it as `plan` already
   run, and `dispatch`; that N workers are STALLED — dispatched, at rest past
   half an hour, no `result.md`, no new commit: `show` the task, then `send` a
-  nudge or `abandon` it; or that it fast-forwarded this checkout and you need
+  nudge or `abandon` it; that N workers were never PROMPTED — dispatched over
+  five minutes ago and never handed the brief: look at the pane, then
+  `fleet queue prompt <ref>`; or that it fast-forwarded this checkout and you need
   `/update-fleet <sha>`. Once each, never mid-turn, and never into an input
   line that holds anything: that waits in your mailbox instead.
 - **It comes back without you.** Your SessionStart hook runs `ensure --if-lead`,
