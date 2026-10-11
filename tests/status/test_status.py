@@ -24,7 +24,7 @@ import time
 from pathlib import Path
 
 import pytest
-from harness import expect, lib, refute, run_fleet, run_queue, write
+from harness import PYTHON, REPO, expect, lib, refute, run, run_fleet, run_queue, write
 from statuskit import (
     GLORBNAK,
     MANY,
@@ -41,6 +41,7 @@ from statuskit import (
     claude,
     fetch,
     fuel_of,
+    meeting,
     ok,
     per_account,
     quota_axi,
@@ -946,3 +947,92 @@ def test_not_a_byte_of_the_queue_is_touched(queue, stubbed):
     status("--json")
     assert snapshot(queue) == before
 
+
+
+# --- 8. it waits on its slowest probe, not on the sum of them -----------------
+
+
+def second_repo(queue: Path, tmp: Path) -> None:
+    """A dispatched task on another checkout, so the forge is asked about two."""
+    (tmp / "repo2").mkdir()
+    ok(run_queue("add", "selftest", "other-repo", "--title", "Another repo", "--repo", str(tmp / "repo2"),
+                 "--branch", "t/other", "--brief-file", str(tmp / "brief.md")))
+    ok(run_queue("attach", "selftest/04-other-repo", "77777777-7777-7777-7777-777777777777"))
+
+
+def test_the_forge_is_asked_about_every_checkout_at_once(queue, stubs, tmp_path):
+    second_repo(queue, tmp_path)
+    stubs.tool("thurbox-cli", answer(json.dumps(SESSIONS)))
+    stubs.tool("quota-axi", fuel_of(64))
+    stubs.tool("gh", meeting(tmp_path / "room", 2, answer(json.dumps(PRS)), ["pr", "list"]))
+    done = status()
+    refute(done.out, "met nobody", "gh exited")
+    expect(done.out, "Thurbeen/fleet#13")
+
+
+def test_the_fuel_reading_and_the_forge_are_asked_at_once(queue, stubs, tmp_path):
+    stubs.tool("thurbox-cli", answer(json.dumps(SESSIONS)))
+    stubs.tool("quota-axi", meeting(tmp_path / "room", 2, fuel_of(64), ["--provider"]))
+    stubs.tool("gh", meeting(tmp_path / "room", 2, answer(json.dumps(PRS)), ["pr", "list"]))
+    done = status()
+    refute(done.out, "met nobody", "gh exited", "quota-axi exited")
+    expect(done.out, "Thurbeen/fleet#13", "  claude  64% remaining")
+
+
+def test_run_as_a_script_it_still_asks_at_once(queue, stubbed, tmp_path):
+    """`python scripts/lib/fleet_status.py` puts scripts/lib first on sys.path,
+    where `queue` is fleet's own queue.py and not the standard library's — so
+    nothing that asks the probes at once may import the latter."""
+    second_repo(queue, tmp_path)
+    done = run([*PYTHON, str(REPO / "scripts" / "lib" / "fleet_status.py")])
+    assert done.code == 0, done.out
+    expect(done.out, "Thurbeen/fleet#13", "  claude  64% remaining")
+
+
+def test_every_checkout_is_listed_and_no_more_than_the_bound_at_once(queue, stubs, tmp_path):
+    """One more checkout than a batch holds: the last, partial batch is still
+    asked, and no more than `PR_LISTS` list calls are ever in flight."""
+    bound = lib("fleet_status.py").PR_LISTS
+    for n in range(bound + 1):
+        repo = tmp_path / f"many-{n}"
+        repo.mkdir()
+        ok(run_queue("add", "selftest", f"many-{n}", "--title", f"Many {n}", "--repo", str(repo),
+                     "--branch", f"t/many-{n}", "--brief-file", str(tmp_path / "brief.md")))
+        ok(run_queue("attach", f"selftest/{n + 4:02d}-many-{n}", f"{n:08d}-0000-0000-0000-000000000000"))
+    room, seen = tmp_path / "room", tmp_path / "seen"
+    stubs.tool("thurbox-cli", answer("[]"))
+    stubs.tool("quota-axi", fuel_of(64))
+    # Every caller waits for all of them, or, once a whole batch is in, for a
+    # grace that only a bounded caller ever spends: callers asked all at once
+    # are then all in the room together, so the one that counts it sees more
+    # than the bound. The fixture's own `repo` checkout makes one more caller.
+    callers = bound + 2
+    stubs.tool("gh", (
+        "import json, os, sys, time\n"
+        f"room, seen, bound, callers = {str(room)!r}, {str(seen)!r}, {bound}, {callers}\n"
+        "for d in (room, seen):\n"
+        "    os.makedirs(d, exist_ok=True)\n"
+        "me = str(os.getpid())\n"
+        "open(os.path.join(seen, me), 'w').close()\n"
+        "open(os.path.join(room, me), 'w').close()\n"
+        "deadline, grace = time.monotonic() + 15, None\n"
+        "while len(os.listdir(seen)) < callers and time.monotonic() < deadline:\n"
+        "    if grace is None and len(os.listdir(room)) >= bound:\n"
+        "        grace = time.monotonic() + 2\n"
+        "    if grace is not None and time.monotonic() > grace:\n"
+        "        break\n"
+        "    time.sleep(0.01)\n"
+        "peak = len(os.listdir(room))\n"
+        "os.remove(os.path.join(room, me))\n"
+        "if peak > bound:\n"
+        "    sys.stderr.write(f'{peak} list calls in flight\\n')\n"
+        "    sys.exit(3)\n"
+        "name = os.path.basename(os.getcwd())\n"
+        "n = int(name.rsplit('-', 1)[1]) if name.startswith('many-') else None\n"
+        "rows = [] if n is None else [{'number': 100 + n, 'url': f'https://github.com/Thurbeen/fleet/pull/{100 + n}',\n"
+        "    'title': name, 'headRefName': 't/' + name, 'state': 'OPEN', 'statusCheckRollup': []}]\n"
+        "sys.stdout.write(json.dumps(rows))\n"
+    ))
+    done = status()
+    refute(done.out, "list calls in flight", "INCOMPLETE")
+    expect(done.out, *(f"Thurbeen/fleet#{100 + n}" for n in range(bound + 1)))
