@@ -42,6 +42,9 @@ def worked(tmp_path, topic, queue_dir) -> dict:
     work = tmp_path / "app"
     git("init", "-q", "-b", "main", str(work))
     git("commit", "-q", "--allow-empty", "-m", "base", cwd=work)
+    # The repository the change requests below are in, so `collect`'s
+    # same-repository check runs on the integration path rather than standing aside.
+    git("remote", "add", "origin", "https://github.com/acme/app.git", cwd=work)
     ok(q("add", topic, "vend", "--title", "Vend", "--repo", str(work),
          "--branch", "feat/vend", "--number", "01", "--publish", "pr"))
     # What the worker's worktree leaves behind: the task's branch, one commit on.
@@ -142,6 +145,9 @@ def test_the_task_branch_own_pr_still_verifies_under_a_flow(worked, stubs, isola
     """feat→develop is the other half of the flow, and it is from the task's branch."""
     flow(isolated_env, "github.com/acme/app = develop\n")
     stubs.plain_pr(1205, "feat/vend")
+    # Onto the integration branch, not onto the `main` the task was cut from:
+    # that is what the flow MEANS, so the base check must accept it.
+    stubs.pr_base(1205, "develop")
     result(worked["dir"], "shipped", "feat→develop is open.", PR + "1205")
     expect(ok(q("collect", "--no-reap")).out, "[publish verified: pr]")
 
