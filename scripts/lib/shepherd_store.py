@@ -103,7 +103,8 @@ below), so THIS IS A CONTRACT: add fields, never rename or retype them.
               "unresolved_threads": 3 | null,   # null: the forge did not say
               "mergeable": "mergeable" | "conflicting" | null,  # null: not computed yet
               "condition": "<classify's word: conflicting, checks-failed,
-                            changes-requested, policy, ready, undetermined,
+                            changes-requested, policy, threads-open, ready,
+                            undetermined,
                             foreign, closed, ...>",
               "detail": "<classify's one line>",
               "action": "sent" | "left-alone" | "fixer" | "merged" | "none",
