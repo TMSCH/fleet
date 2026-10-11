@@ -83,7 +83,9 @@ when no session remains. `d` always
 opens the record. Click the topic chip or press `t` to search topic names and
 slugs in the bottom detail area while the board stays visible. Select with
 Enter or a click. Esc cancels; All topics clears the
-filter. Agent, needs-me and landed chips filter or fold the view. Fuel is
+filter. Agent, needs-me and landed chips filter or fold the view. A coloured
+dot per pull request — from the shepherd's last pass — sits on each card's
+publish line, and sessions the shepherd adopted get a row of their own. Fuel is
 hidden by default; click its chip or press `f` for compact gauges in two
 columns. Esc returns from the record, then closes the board.
 

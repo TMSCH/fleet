@@ -250,13 +250,15 @@ names every path and the reason for each.
   it adopted — and `briefs/`, the files the one-line messages to adopted
   sessions point at. Written by `fleet queue shepherd`
   (`scripts/lib/shepherd_store.py`, whose docstring is the store's schema),
-  read by `fleet queue prs [--json]`, and never a queue record: "this PR was
+  read by `fleet queue prs [--json | --records]` (`--records` is the board's
+  wire, each PR with its dot word), and never a queue record: "this PR was
   red at 14:02" and "that session was told" are one machine's observations,
   and an adopted session has no task to write them on. `FLEET_SHEPHERD_DIR`
   moves it.
 - `interface/fleet_kanban.lua` — the Alt+K full-screen queue dashboard;
   `interface/fleet_queue.lua` remains the optional legacy column. Both use
-  `interface/fleet_reader.lua` over the same records `fleet queue list` reads.
+  `interface/fleet_reader.lua` over the same records `fleet queue list` reads,
+  plus `fleet queue prs --records` for the PR dots — no store, no dots.
   `interface/fleet_lead.lua` is the Ctrl+X key to Mission Control: it
   reaches the lead of the fleet that installed last, by the cwd the installer
   renders into the gitignored `interface/fleet_home.lua`.

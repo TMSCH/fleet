@@ -52,7 +52,8 @@ return {
         last_reading.lead,
         last_reading.fleet,
         "queue unavailable · showing last records",
-        last_reading.peers
+        last_reading.peers,
+        last_reading.prs
       )
     end
     if reading.error then
@@ -69,7 +70,7 @@ return {
       return node
     end
     last_reading = reading
-    return board.render(ctx, reading.model, reading.fuel, reading.lead, reading.fleet, nil, reading.peers)
+    return board.render(ctx, reading.model, reading.fuel, reading.lead, reading.fleet, nil, reading.peers, reading.prs)
   end,
   on_action = function(action)
     if action == "fleetqueue.board" then

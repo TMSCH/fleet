@@ -76,7 +76,8 @@ THE STORE. `<store dir>/prs.json`, where the store dir is FLEET_SHEPHERD_DIR or
 `orchestration/reconcile/` is). Rewritten whole, atomically, by every shepherd
 pass that is not a `--dry-run`, through `fleet_platform.write_record` (UTF-8,
 LF). The board's coloured PR dots read ONLY this file, through `fleet queue
-prs --json`, so THIS IS A CONTRACT: add fields, never rename or retype them.
+prs --records` (the same store as tab-separated lines; see "the board's wire"
+below), so THIS IS A CONTRACT: add fields, never rename or retype them.
 
     {
       "schema": 1,
@@ -143,6 +144,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 
 SCHEMA = 1
 STORE_ENV = "FLEET_SHEPHERD_DIR"
@@ -644,8 +646,101 @@ def print_adopted(rows: list, dry_run: bool) -> None:
           "\n          fleet never sends them a fixer.\n")
 
 
+# --- the board's wire ---------------------------------------------------------
+#
+# `fleet queue prs --records` is the store again, as tab-separated lines a pane
+# can split: a thurbox pane is Lua with no JSON parser (`fleet status --fuel`
+# exists for the same reason). `interface/fleet_reader.lua` is its one reader.
+#
+#   S <session id> <task ref, or empty> <adopted 1|0> <name>
+#   P <session id> <dot> <number> <url> <repo> <state> <checks>
+#     <review decision> <unresolved threads, or empty> <mergeable> <condition>
+#     <stale reason> <title>
+#
+# Each P follows the S of its session. `<dot>` is one word of DOTS, decided
+# here so the pane colours a word and never re-derives one. A store that cannot
+# be read is one `E <why>` line; a missing one prints nothing, because a fleet
+# whose shepherd never ran has no PRs to draw and is not at fault.
+
+# Every word `<dot>` can be, most decisive first. The pane colours them the
+# usual way: red for what cannot merge as it stands, amber for a person waiting
+# on the session, green for nothing blocking, grey for in flux.
+DOTS = ("merged", "closed", "stale", "failing", "conflicting", "changes", "ready", "pending")
+
+
+def freshness_secs(q) -> int:
+    """How old an entry may be before its dot says `stale`: two shepherd passes.
+
+    The cadence is the reconciler's `SHEPHERD_SECS`, read the way `reconcile.py`
+    reads it; one missed pass is ordinary, two is a shepherd that stopped.
+    """
+    said = os.environ.get("FLEET_RECONCILE_SHEPHERD_SECS") or q.reconcile_conf().get("SHEPHERD_SECS", "")
+    try:
+        secs = int(str(said).strip())
+    except ValueError:
+        secs = 900
+    return 2 * max(60, secs)
+
+
+def epoch(stamp) -> float | None:
+    try:
+        return datetime.fromisoformat(str(stamp)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def dot_word(entry: dict, now: float, window: int) -> str:
+    """The one word a PR's dot is drawn as. Terminal is terminal; unknown is never green."""
+    state = entry.get("state")
+    if state in TERMINAL:
+        return state
+    seen = epoch(entry.get("observed_at"))
+    if entry.get("stale") or seen is None or now - seen > window:
+        return "stale"
+    if entry.get("checks") == "failing":
+        return "failing"
+    if entry.get("mergeable") == "conflicting":
+        return "conflicting"
+    if entry.get("review_decision") == "changes-requested" or (entry.get("unresolved_threads") or 0) > 0:
+        return "changes"
+    if state == "open" and entry.get("checks") == "passing" and entry.get("mergeable") == "mergeable":
+        return "ready"
+    return "pending"
+
+
+def field(value) -> str:
+    """One value as a wire field: no tab or newline can split a record."""
+    return re.sub(r"[\t\r\n]+", " ", "" if value is None else str(value))
+
+
+def records(q, doc: dict, now: float) -> list[str]:
+    window = freshness_secs(q)
+    out = []
+    sessions = doc.get("sessions") or {}
+    for sid, s in sorted(sessions.items(), key=lambda kv: str(kv[1].get("name") or kv[0])):
+        out.append("\t".join(field(v) for v in ("S", sid, s.get("task") or "", "1" if s.get("adopted") else "0",
+                                                s.get("name") or "")))
+        for e in s.get("prs") or []:
+            stale_reason = e.get("stale_reason") or ""
+            dot = dot_word(e, now, window)
+            if dot == "stale" and not stale_reason:
+                stale_reason = "not observed in the last two shepherd passes"
+            out.append("\t".join(field(v) for v in (
+                "P", sid, dot, e.get("number"), e.get("url"), e.get("repo"), e.get("state"), e.get("checks"),
+                e.get("review_decision") or "", e.get("unresolved_threads"), e.get("mergeable") or "",
+                e.get("condition"), stale_reason, e.get("title"))))
+    return out
+
+
 def cmd_prs(q, args) -> int:
     doc, why = load(q)
+    if getattr(args, "records", False):
+        if why:
+            print("E\t" + field(why))
+        else:
+            for line in records(q, doc, datetime.now(timezone.utc).timestamp()):
+                print(line)
+        return 0
     if args.json:
         print(json.dumps(doc, indent=2, ensure_ascii=False))
         return 0

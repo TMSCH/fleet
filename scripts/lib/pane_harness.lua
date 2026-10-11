@@ -28,6 +28,11 @@
 -- `accent` role and `.` when none is, which is how a mark carried by colour
 -- alone — the binding fuel window — is asserted in a text render.
 --
+-- `--prs` adds the shepherd store's wire (`fleet queue prs --records`): two
+-- PRs under the `green` task, one failing and one ready, and one pending under
+-- the `open` one. `--tones` then prefixes every row with the theme role of each
+-- PR dot on it, so a colour is asserted in a text render.
+--
 -- `--frame` prints the frame instead of the rows: its title, then its
 -- top-right overlay, which is where the hide button lives, then its
 -- bottom-right overlay, which is where the scroll position lives.
@@ -105,7 +110,13 @@ local FUEL_CHECKOUT_NO_CREDENTIAL = false
 local FUEL_UNREADABLE = false
 local FUEL_ACCOUNTS_UNREADABLE = false
 local QUEUE = nil
+local PRS, TONES = false, false
 for i, a in ipairs(arg) do
+  if a == "--prs" then
+    PRS = true
+  elseif a == "--tones" then
+    TONES = true
+  end
   if a == "--long-label" then
     LONG_LABEL = true
   elseif a == "--fuel-accounts" then
@@ -684,6 +695,18 @@ _G.thurbox.runs = {
   ["fleetqueue:s1"] = { state = "ok", stdout = table.concat(out, "\n") .. "\n" },
   ["fleetfuel:s1"] = { state = "ok", stdout = FUEL .. "\n" },
 }
+if PRS then
+  local function pr(sid, dot, n, checks)
+    return table.concat({ "P", sid, dot, tostring(n), "https://github.com/Thurbeen/fleet/pull/" .. n,
+      "github.com/Thurbeen/fleet", "open", checks, "", "0", "mergeable", "ready", "", "PR " .. n }, "\t")
+  end
+  _G.thurbox.runs["fleetprs:s1"] = { state = "ok", stdout = table.concat({
+    "S\tw1\tretire-webui/01-remove-the-monitor\t0\tRemove the web monitor",
+    pr("w1", "failing", 47, "failing"), pr("w1", "ready", 48, "passing"),
+    "S\tw3\tretire-webui/03-drop-the-webui-selftest\t0\tDrop the selftest",
+    pr("w3", "pending", 52, "pending"),
+  }, "\n") .. "\n" }
+end
 
 -- `--leads remote-first`: a lead MIRRORED from another machine, listed before
 -- the local one, whose queue is empty — thurbox sets `host` on a session it
@@ -744,13 +767,16 @@ local function lines_of(node, sink)
     rows = { rows }
   end
   for _, spans in ipairs(rows) do
-    local text, bold, accent = "", false, false
+    local text, bold, accent, tones = "", false, false, {}
     for _, span in ipairs(spans) do
       text = text .. (span.text or "")
       bold = bold or (span.style and span.style.bold) or false
       accent = accent or (span.style and span.style.fg == "accent") or false
+      if ({ ["●"] = true, ["◉"] = true, ["○"] = true, ["◌"] = true })[span.text] then
+        tones[#tones + 1] = tostring(span.style and span.style.fg)
+      end
     end
-    sink[#sink + 1] = { text = text, bold = bold, accent = accent }
+    sink[#sink + 1] = { text = text, bold = bold, accent = accent, tones = table.concat(tones, ",") }
   end
   return sink
 end
@@ -892,6 +918,8 @@ for _, row in ipairs(lines_of(tree, {})) do
     print((row.bold and "B " or ". ") .. text)
   elseif ACCENT then
     print((row.accent and "A " or ". ") .. text)
+  elseif TONES then
+    print((row.tones ~= "" and row.tones or ".") .. " | " .. text)
   else
     print(text)
   end
