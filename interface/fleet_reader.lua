@@ -158,6 +158,45 @@ local PEERS_TTL = 30
 local PEERS_TIMEOUT = 60
 local PEERS_PROBE = "uv run --frozen --quiet fleet peers --records"
 
+--- Every watched pull request, as the last shepherd pass recorded it.
+---
+--- `fleet queue prs --records` prints `orchestration/shepherd/prs.json` — the
+--- store `fleet queue shepherd` alone writes — as one `S` line per session and
+--- one `P` line per change request, each already carrying its DOT word
+--- (`scripts/lib/shepherd_store.py`'s "the board's wire" owns the format and
+--- the word). The pane never asks a forge: the shepherd already did, on its own
+--- cadence, and a second reader of the forge would be a second opinion.
+---
+--- Thirty seconds, because the store moves only once a shepherd pass (fifteen
+--- minutes by default); a file read is cheap, but `uv run` is a process.
+--- A fleet whose shepherd never ran has no store, and the command then prints
+--- nothing: no dots, no error, and the board exactly as it was.
+local PRS_TTL = 30
+local PRS_TIMEOUT = 30
+local PRS_PROBE = "uv run --frozen --quiet fleet queue prs --records"
+
+--- How each dot word is drawn: a theme role, a one-cell glyph a plain terminal
+--- has, and the word the legend and the detail view say.
+---
+--- The usual PR-watching convention: RED for a PR that cannot merge as it
+--- stands, AMBER for a person waiting on the session (waiting is not
+--- breakage), GREEN for nothing blocking, GREY for in flux. Failing and
+--- conflicting are both red — both mean "cannot merge" — and told apart by shape.
+--- A finished PR keeps a dot, so how it ended stays visible, and an entry the
+--- shepherd could not refresh says so rather than keep a colour it may have
+--- lost. A word this pane does not know is drawn muted under its own name.
+local DOTS = {
+  ready = { role = "ok", glyph = "●", label = "ready" },
+  pending = { role = "muted", glyph = "●", label = "pending" },
+  failing = { role = "bad", glyph = "●", label = "failing" },
+  conflicting = { role = "bad", glyph = "◉", label = "conflict" },
+  changes = { role = "warn", glyph = "●", label = "changes" },
+  merged = { role = "accent", glyph = "●", label = "merged" },
+  closed = { role = "muted", glyph = "○", label = "closed" },
+  stale = { role = "muted", glyph = "◌", label = "stale" },
+}
+local DOT_ORDER = { "ready", "pending", "failing", "conflicting", "changes", "merged", "closed", "stale" }
+
 -- ── Reading the probe ──────────────────────────────────────────────────────
 
 --- A YAML scalar with its quoting off, and `null` read as the absence it is.
@@ -427,6 +466,45 @@ local function build_peers(stdout)
   return out
 end
 
+--- The PR store's wire: change requests by task ref, and the sessions fleet
+--- did not spawn (`adopted`), each with its own.
+local function build_prs(stdout)
+  local out, current = { by_task = {}, adopted = {}, count = 0 }, nil
+  for line in (stdout .. "\n"):gmatch("(.-)\n") do
+    local f = split_tabs(line)
+    if f[1] == "S" then
+      current = { session = f[2] or "", task = f[3] or "", adopted = f[4] == "1", name = f[5] or "", prs = {} }
+      if current.adopted then
+        out.adopted[#out.adopted + 1] = current
+      elseif current.task ~= "" then
+        out.by_task[current.task] = out.by_task[current.task] or {}
+      end
+    elseif f[1] == "P" and current and f[2] == current.session then
+      local pr = {
+        dot = f[3] or "",
+        number = tonumber(f[4]),
+        url = f[5] or "",
+        repo = f[6] or "",
+        state = f[7] or "",
+        checks = f[8] or "",
+        review = f[9] or "",
+        threads = tonumber(f[10]),
+        mergeable = f[11] or "",
+        condition = f[12] or "",
+        stale_reason = f[13] or "",
+        title = f[14] or "",
+      }
+      current.prs[#current.prs + 1] = pr
+      if not current.adopted and current.task ~= "" then
+        local list = out.by_task[current.task]
+        list[#list + 1] = pr
+      end
+      out.count = out.count + 1
+    end
+  end
+  return out
+end
+
 --- `build_model`, done again only when the output actually changed.
 ---
 --- The kernel keeps the previous answer readable while a refresh is in flight,
@@ -438,7 +516,7 @@ local memos = {}
 local function memo_for(view)
   view = view or "default"
   if not memos[view] then
-    memos[view] = { queue = {}, fuel = {}, peers = {} }
+    memos[view] = { queue = {}, fuel = {}, peers = {}, prs = {} }
   end
   return memos[view]
 end
@@ -561,6 +639,17 @@ local function peers_for(stdout, view)
     parsed.peers = build_peers(stdout)
   end
   return parsed.peers
+end
+
+--- `build_prs`, done again only when the wire actually changed — so an
+--- unchanged answer hands the board the same tables, and its card cache holds.
+local function prs_for(stdout, view)
+  local parsed = memo_for(view).prs
+  if parsed.src ~= stdout then
+    parsed.src = stdout
+    parsed.prs = build_prs(stdout)
+  end
+  return parsed.prs
 end
 
 local selected_fleet
@@ -692,6 +781,16 @@ function M.read(ctx, view)
     end
   end
 
+  -- No answer, a failed one and an empty one are all "no PRs recorded": a
+  -- fleet whose shepherd never ran draws exactly what it drew before dots.
+  local prs_key = "fleetprs:" .. lead.id
+  run(prs_key, PRS_PROBE, { session = lead.id, ttl = PRS_TTL, timeout = PRS_TIMEOUT })
+  local prs_answer = (thurbox.runs or {})[prs_key]
+  local prs
+  if prs_answer and prs_answer.state ~= "failed" and (prs_answer.stdout or "") ~= "" then
+    prs = prs_for(prs_answer.stdout, view)
+  end
+
   if not answer or answer.state == "pending" then
     return { error = { spinner .. " reading the queue…" }, lead = lead, fleet = fleet }
   end
@@ -708,7 +807,7 @@ function M.read(ctx, view)
   if model.error then
     return { error = { model.error, lead.cwd }, lead = lead, fleet = fleet }
   end
-  return { model = model, fuel = fuel, lead = lead, fleet = fleet, spinner = spinner, peers = peers }
+  return { model = model, fuel = fuel, lead = lead, fleet = fleet, spinner = spinner, peers = peers, prs = prs }
 end
 --- A directory as `fleet install-extension` and thurbox may each spell it.
 local function same_dir(a, b)
@@ -765,5 +864,11 @@ M.model_for = function(stdout)
   return model_for(stdout)
 end
 M.FLEET_MARK = FLEET_MARK
+M.DOT_ORDER = DOT_ORDER
+
+--- How a dot word is drawn, as `{ role, glyph, label }`.
+function M.dot(word)
+  return DOTS[word] or { role = "muted", glyph = "●", label = word ~= "" and word or "unknown" }
+end
 M.FUEL_TTL, M.FUEL_TIMEOUT = FUEL_TTL, FUEL_TIMEOUT
 return M

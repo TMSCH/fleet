@@ -312,6 +312,45 @@ local peer_wire = table.concat({
 if scenario:match("^peers") and scenario ~= "peers-none" then
   thurbox.runs["fleetpeers:lead"] = { state = "done", stdout = peer_wire }
 end
+-- The shepherd store's wire (`fleet queue prs --records`): one PR in every dot
+-- state under the failing task, one under the working task, and two sessions
+-- fleet never spawned. Numbers 101..108 follow DOT_STATES' order.
+local DOT_STATES = {
+  { "ready", "ok" },
+  { "pending", "muted" },
+  { "failing", "bad" },
+  { "conflicting", "bad" },
+  { "changes", "warn" },
+  { "merged", "accent" },
+  { "closed", "muted" },
+  { "stale", "muted" },
+}
+local function pr_line(sid, dot, n, extra)
+  extra = extra or {}
+  return table.concat({
+    "P", sid, dot, tostring(n), "https://github.com/example/repo/pull/" .. n, "github.com/example/repo",
+    extra.state or "open", extra.checks or "passing", extra.review or "", extra.threads or "0",
+    extra.mergeable or "mergeable", extra.condition or "ready", extra.stale or "", "PR " .. n,
+  }, "\t")
+end
+local pr_wire = { "S\ts-adopt-1\t\t1\thand-made fix", pr_line("s-adopt-1", "failing", 201, { checks = "failing" }),
+  "S\ts-adopt-2\t\t1\tdocs session", pr_line("s-adopt-2", "ready", 202),
+  "S\tworker\talpha/03-work\t0\tWorking", pr_line("worker", "changes", 109, { threads = "3" }),
+  "S\ts-pr\talpha/04-pr\t0\tFailing PR" }
+for i, dot in ipairs(DOT_STATES) do
+  local extra = ({
+    failing = { checks = "failing" },
+    conflicting = { mergeable = "conflicting" },
+    changes = { review = "changes-requested", threads = "2" },
+    merged = { state = "merged" },
+    closed = { state = "closed" },
+    stale = { stale = "gh could not be read", threads = "" },
+  })[dot[1]]
+  pr_wire[#pr_wire + 1] = pr_line("s-pr", dot[1], 100 + i, extra)
+end
+if scenario:match("^pr%-") and scenario ~= "pr-missing" or scenario == "render-readonly" then
+  thurbox.runs["fleetprs:lead"] = { state = "done", stdout = table.concat(pr_wire, "\n") .. "\n" }
+end
 local calls, commands = {}, {}
 _G.run = function(key, cmd, opts)
   calls[#calls + 1] = { key = key, cmd = cmd, opts = opts }
@@ -937,6 +976,122 @@ elseif scenario == "peers-picker" then
   assert(table.concat(rows, ",") == "board-topic:*,board-topic:alpha,board-topic:far", table.concat(rows, ","))
   assert(pane.on_key({ key = "h", char = "h" }), "the fleet key stopped typing into search")
   assert(state.board_picker.field.value == "h")
+elseif scenario == "pr-dots" or scenario == "pr-dots-narrow" then
+  -- Every dot state, each in its own theme role and linked to its PR.
+  local seen = {}
+  for _, n in ipairs(nodes(tree())) do
+    for _, line in ipairs(type(n.text) == "table" and n.text or {}) do
+      for _, s in ipairs(line.text and { line } or line) do
+        local number = (s.role or ""):match("^url:https://github%.com/example/repo/pull/(%d+)$")
+        if number and #(s.text or "") > 0 and s.text ~= " " and not s.text:find("PR", 1, true) then
+          seen[tonumber(number)] = s.style and s.style.fg
+        end
+      end
+    end
+  end
+  for i, dot in ipairs(DOT_STATES) do
+    assert(seen[100 + i] == dot[2], dot[1] .. " dot drew " .. tostring(seen[100 + i]) .. ", not " .. dot[2])
+  end
+  assert(seen[109] == "warn", "the working task's dot is missing")
+  if scenario == "pr-dots" then
+    -- The legend, in the header's spare room.
+    for _, word in ipairs({ "PRs", "ready", "pending", "failing", "conflict", "changes", "merged", "closed", "stale" }) do
+      contains(word)
+    end
+  end
+  local probe
+  for _, call in ipairs(calls) do
+    if call.key == "fleetprs:lead" then
+      probe = call
+    end
+  end
+  assert(probe and probe.cmd:find("fleet queue prs --records", 1, true), "the board does not read the PR store")
+  assert(probe.opts.ttl and probe.opts.timeout, "the PR probe is not cached and bounded")
+elseif scenario == "pr-outside" then
+  contains("Outside sessions · 2")
+  contains("hand-made fix")
+  contains("docs session")
+  pane.on_click({ id = "board:alpha/04-pr" })
+  assert(state.board_ref == "alpha/04-pr", "the outside row broke card navigation")
+elseif scenario == "pr-detail" then
+  pane.on_click({ id = "board:alpha/04-pr" })
+  action("detail")
+  local out = strings(tree())
+  for _, want in ipairs({
+    "Change requests", "#101", "#108", "checks failing", "review changes-requested", "2 unresolved threads",
+    "threads unknown", "gh could not be read", "conflict", "merged", "closed", "stale",
+  }) do
+    assert(out:find(want, 1, true), want .. " missing from the detail view")
+  end
+  -- A task with no PR in the store lists none.
+  action("close")
+  pane.on_click({ id = "board:alpha/01-ready" })
+  action("detail")
+  assert(not strings(tree()):find("Change requests", 1, true), "a task with no PR lists change requests")
+elseif scenario == "pr-capture" then
+  -- A text capture of the board and of one record's detail, panel by panel:
+  -- what a pull request description shows of the dots.
+  local function dump(root)
+    local out = {}
+    local function walk(node)
+      if node.frame then
+        local title = {}
+        for _, s in ipairs(node.frame.title or {}) do
+          title[#title + 1] = s.text
+        end
+        out[#out + 1] = "── " .. table.concat(title) .. " ──"
+      end
+      if type(node.text) == "table" then
+        for _, line in ipairs(node.text) do
+          local row = {}
+          for _, s in ipairs(line.text and { line } or line) do
+            row[#row + 1] = s.text or ""
+          end
+          local joined = table.concat(row):gsub("%s+$", "")
+          if joined ~= "" then
+            out[#out + 1] = joined
+          end
+        end
+      end
+      for _, child in ipairs(node.children or {}) do
+        walk(child)
+      end
+    end
+    walk(root)
+    return out
+  end
+  local board_lines = dump(tree())
+  pane.on_click({ id = "board:alpha/04-pr" })
+  action("detail")
+  local detail_lines = dump(tree())
+  for _, l in ipairs(board_lines) do
+    print(l)
+  end
+  print("")
+  for _, l in ipairs(detail_lines) do
+    print(l)
+  end
+  local all = table.concat(board_lines, "\n")
+  assert(all:find("Outside sessions", 1, true) and all:find("●◉", 1, true), "capture lost the dots")
+elseif scenario == "pr-missing" then
+  -- No store, a failed command and a store that cannot be read all draw the
+  -- board exactly as before: no dots, no outside row, no legend, no error.
+  local plain = strings(tree())
+  for _, answer in ipairs({
+    false,
+    { state = "failed", stdout = "" },
+    { state = "done", stdout = "" },
+    { state = "done", stdout = "E\tprs.json could not be read\n" },
+  }) do
+    thurbox.runs["fleetprs:lead"] = answer or nil
+    local out = strings(tree())
+    assert(out == plain, "a missing PR store changed the board")
+    assert(not out:find("Outside sessions", 1, true) and not out:find("PRs ", 1, true), "drew PR furniture")
+    assert(not out:find("could not be read", 1, true), "a missing store is drawn as an error")
+  end
+  pane.on_click({ id = "board:alpha/04-pr" })
+  action("detail")
+  assert(not strings(tree()):find("Change requests", 1, true))
 elseif scenario == "failure" then
   thurbox.runs["fleetqueue:lead"] = { state = "failed", stdout = "" }
   contains("queue unavailable")

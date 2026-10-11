@@ -701,7 +701,13 @@ dots read it through:
 
 ```bash
 uv run fleet queue prs [--json]   # read-only; prints what the last pass wrote
+uv run fleet queue prs --records  # the same, as the board's tab-separated wire
 ```
+
+Each `--records` PR carries one dot word: `merged`, `closed`, `stale` (marked
+stale, or not observed in two `SHEPHERD_SECS` passes), `failing`,
+`conflicting`, `changes` (changes requested or unresolved threads), `ready`
+(checks passing and mergeable) or `pending` — most decisive first.
 
 `shepherd` is a sibling of `collect`, not part of it: `collect` reads local
 files and works offline, and folding a session-spawning, forge-calling side

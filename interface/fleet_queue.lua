@@ -553,6 +553,18 @@ local PUBLISH_WORD = {
 --- unlike the `⛽` above it — so it needs no off switch of its own.
 local PUBLISH_GLYPH = "⇡"
 
+--- The shepherd's PR store as `fleet_reader` last read it, or nil when there is
+--- none. When it holds a task's change requests, their DOTS take the glyph's
+--- place on the publish row — one cell each, in the colour of each PR's state
+--- (`fleet_reader.dot`) — so the row says which PR is red without growing.
+local pr_store
+
+--- The dots for a task's publish row, or nil to draw the plain glyph.
+local function dots_of(task)
+  local list = pr_store and pr_store.by_task[task.topic .. "/" .. task.id]
+  return list and #list > 0 and list or nil
+end
+
 --- What the publish row gives up as the column narrows, in order.
 ---
 --- The same shape `note_spans` uses — drop in a fixed order, truncate last —
@@ -897,6 +909,8 @@ local function publish_spans(task, width)
   end
 
   local ref = artifact_ref(task.artifact)
+  local dots = dots_of(task)
+  local glyph_cells = dots and #dots or widgets.len(PUBLISH_GLYPH)
 
   --- The segments this row would carry at one rung of the ladder.
   local function segments(rung)
@@ -912,7 +926,7 @@ local function publish_spans(task, width)
   end
 
   local function columns(list, rung)
-    local n = rung.glyph and widgets.len(PUBLISH_GLYPH .. " ") or 0
+    local n = rung.glyph and (glyph_cells + 1) or 0
     for index, seg in ipairs(list) do
       n = n + widgets.len(seg) + (index > 1 and 3 or 0)
     end
@@ -940,7 +954,13 @@ local function publish_spans(task, width)
 
   local row = ui.row({ width = width })
   row:add("   ")
-  if level.glyph then
+  if level.glyph and dots then
+    for _, pr in ipairs(dots) do
+      local look = reader.dot(pr.dot)
+      row:add(look.glyph, { fg = theme[look.role] })
+    end
+    row:add(" ")
+  elseif level.glyph then
     row:add(PUBLISH_GLYPH .. " ", { fg = theme[tone] })
   end
   for index, seg in ipairs(chosen) do
@@ -1728,6 +1748,7 @@ return {
     local width = math.max(4, (ctx.width or 30) - 2)
 
     local reading = reader.read(ctx, "column")
+    pr_store = reading.prs
     if reading.error then
       return saying(reading.error, width)
     end

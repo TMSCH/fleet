@@ -11361,6 +11361,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "recorded it; reads only that file")
     ps.add_argument("--json", action="store_true",
                     help="the store itself; its schema is shepherd_store.py's docstring")
+    ps.add_argument("--records", action="store_true",
+                    help="one tab-separated line per session and PR, each PR with its dot; the board's wire")
     ps.set_defaults(func=cmd_prs)
 
     rn = sub.add_parser("run", help="refresh the run log this topic writes into")

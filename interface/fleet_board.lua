@@ -3,6 +3,9 @@
 -- Node roles leave links to thurbox’s native handler.
 -- Other fleets' cards (`fleet peers`) are drawn only when the fleet filter asks
 -- for them, and are read-only: nothing here focuses, opens or acts on them.
+-- PR dots come from the shepherd's store (`fleet queue prs --records`, read by
+-- fleet_reader): drawn, linked, and never acted on.
+local reader = require("lib.fleet_reader")
 local ui = require("lib.ui")
 local widgets = require("lib.widgets")
 local theme = require("lib.theme")
@@ -17,6 +20,8 @@ local cached_model, cached_filter, locations, heights_by_column = nil, nil, {}, 
 -- The fleet filter's choices and whether more than one fleet is on screen.
 local cached_peers, scopes, multi = nil, {}, false
 local view_column, view_index, detail_offset = 1, 1, 0
+-- The last PR store reading, or nil when there is none (no shepherd ever ran).
+local pr_store
 local function span(value, color, role)
   return { text = value, style = { fg = color or theme.text }, role = role }
 end
@@ -46,6 +51,61 @@ local function linked(value)
     pos = last
   end
   out[#out + 1] = span(value:sub(pos), theme.secondary)
+  return out
+end
+--- The change requests the shepherd store holds for a task, or nil. Another
+--- fleet's card has none here: its store is on its own host.
+local function prs_of(task)
+  if task.peer or not pr_store then
+    return nil
+  end
+  local list = pr_store.by_task[task.ref]
+  return list and #list > 0 and list or nil
+end
+--- One dot per change request, each a link to it.
+local function add_dots(out, list)
+  for _, pr in ipairs(list) do
+    local look = reader.dot(pr.dot)
+    out[#out + 1] = span(look.glyph, theme[look.role], url(pr.url) and "url:" .. pr.url or nil)
+  end
+  return out
+end
+--- The legend: every dot word, in its own colour.
+local function legend_spans(lead_text)
+  local out = { span(lead_text, theme.muted) }
+  for _, word in ipairs(reader.DOT_ORDER) do
+    local look = reader.dot(word)
+    out[#out + 1] = span(look.glyph, theme[look.role])
+    out[#out + 1] = span(" " .. look.label .. "  ", theme.muted)
+  end
+  return out
+end
+local function spans_width(list)
+  local n = 0
+  for _, run in ipairs(list) do
+    n = n + widgets.len(run.text)
+  end
+  return n
+end
+--- One change request as the detail view lists it.
+local function pr_line(pr)
+  local look = reader.dot(pr.dot)
+  local review = pr.review ~= "" and pr.review or "no decision"
+  local threads = pr.threads and (pr.threads .. " unresolved thread" .. (pr.threads == 1 and "" or "s"))
+    or "threads unknown"
+  local out = {
+    span(" " .. look.glyph .. " ", theme[look.role]),
+    span("#" .. (pr.number or "?"), theme.accent, url(pr.url) and "url:" .. pr.url or nil),
+    span(" " .. look.label, theme[look.role]),
+    span(" · checks " .. (pr.checks ~= "" and pr.checks or "unknown") .. " · review " .. review .. " · " .. threads,
+      theme.secondary),
+  }
+  if pr.dot == "stale" and pr.stale_reason ~= "" then
+    out[#out + 1] = span(" · " .. pr.stale_reason, theme.warn)
+  end
+  if pr.title ~= "" then
+    out[#out + 1] = span(" · " .. pr.title, theme.muted)
+  end
   return out
 end
 local function needs(task)
@@ -167,21 +227,31 @@ local function card_spans(row, width)
     local spec = live and theme.status(live.status or "unreported") or { glyph = "—", color = theme.muted }
     b:add(spec.glyph .. " " .. (live and (live.status or "unreported") or "no session"), { fg = spec.color })
   elseif row.line == 4 then
+    -- The task's PR dots, ahead of the publish line they qualify.
+    local dots = prs_of(task)
+    local lead_spans = dots and add_dots({ span(" ") }, dots) or {}
+    local room = width - spans_width(lead_spans)
     local link = url(task.artifact)
     if link then
       local number = link:match("/pull/(%d+)") or link:match("/merge_requests/(%d+)")
       local label = number and (link:find("/pull/", 1, true) and "PR #" or "MR !") .. number or "artifact"
-      local spans = {
-        span(" " .. label, theme.accent, "url:" .. link),
-        span(
-          " " .. widgets.truncate(note(task), math.max(0, width - #label - 11)),
-          task.publish_state == "checks-failed" and theme.bad or theme.muted
-        ),
-      }
+      local spans = lead_spans
+      spans[#spans + 1] = span(" " .. label, theme.accent, "url:" .. link)
+      spans[#spans + 1] = span(
+        " " .. widgets.truncate(note(task), math.max(0, room - #label - 11)),
+        task.publish_state == "checks-failed" and theme.bad or theme.muted
+      )
       if url(task.review) then
         spans[#spans + 1] = span(" review", theme.accent, "url:" .. task.review)
       end
       return spans
+    end
+    if dots then
+      lead_spans[#lead_spans + 1] = span(
+        " " .. widgets.truncate(note(task), math.max(0, room - 2)),
+        needs(task) and theme.warn or theme.muted
+      )
+      return lead_spans
     end
     b:add(
       " " .. widgets.truncate(note(task), math.max(0, width - 2)),
@@ -328,6 +398,17 @@ local function detail(ctx, warning)
     content = "Reading record…"
   end
   local width = math.max(1, ctx.width - 4)
+  -- The task's change requests first, from the shepherd's store, then the
+  -- record. Each row is a fact the store recorded; nothing here asks a forge.
+  local list = pr_store and pr_store.by_task[state.board_detail]
+  if list and #list > 0 then
+    lines[#lines + 1] = { span("Change requests · as the last shepherd pass saw them", theme.text) }
+    for _, pr in ipairs(list) do
+      lines[#lines + 1] = pr_line(pr)
+    end
+    lines[#lines + 1] = legend_spans(" ")
+    lines[#lines + 1] = {}
+  end
   for original in (content .. "\n"):gmatch("(.-)\n") do
     local row, room = {}, width
     local function flush()
@@ -547,9 +628,10 @@ local function in_scope(scope, peer)
 end
 -- One empty table, so a board with no peers keeps its card cache between frames.
 local NO_PEERS = {}
-function M.render(ctx, model, fuel, worker, fleet, warning, peers)
+function M.render(ctx, model, fuel, worker, fleet, warning, peers, prs)
   lead = worker
   peers = peers or NO_PEERS
+  pr_store = prs
   local now = (thurbox.taken_at_ms or widgets.now_ms()) / 1000
   -- A choice that names a peer no longer on the wire falls back to this fleet
   -- for the frame, without writing state: rendering is read-only.
@@ -647,7 +729,31 @@ function M.render(ctx, model, fuel, worker, fleet, warning, peers)
   local width = ctx.width - 2
   local fuel_view = state.board_fuel and fuel_node(fuel, width) or { type = "box", len = 0, children = {} }
   local strip_height = state.board_picker and 8 or 6
-  local board_height = ctx.height - 5 - strip_height - fuel_view.len
+  -- Sessions fleet did not spawn but the shepherd adopted: no task, so no
+  -- card. They get one row of their own, and only when there are any.
+  local outside = { type = "box", len = 0, children = {} }
+  if pr_store and #pr_store.adopted > 0 and in_scope(scope, nil) then
+    local runs = { span(" Outside sessions · " .. #pr_store.adopted .. "  ", theme.secondary) }
+    local used, shown = spans_width(runs), 0
+    for _, entry in ipairs(pr_store.adopted) do
+      local piece = add_dots({}, entry.prs)
+      piece[#piece + 1] = span(" " .. widgets.truncate(entry.name ~= "" and entry.name or entry.session, 24) .. "   ",
+        theme.text)
+      local cost = spans_width(piece)
+      if used + cost > width - 10 then
+        break
+      end
+      for _, run in ipairs(piece) do
+        runs[#runs + 1] = run
+      end
+      used, shown = used + cost, shown + 1
+    end
+    if shown < #pr_store.adopted then
+      runs[#runs + 1] = span("+" .. (#pr_store.adopted - shown) .. " more", theme.muted)
+    end
+    outside = text(runs)
+  end
+  local board_height = ctx.height - 5 - strip_height - fuel_view.len - outside.len
   local per = ctx.width >= 180 and 6 or 3
   geometry = { now = now }
   local bands = {}
@@ -676,6 +782,16 @@ function M.render(ctx, model, fuel, worker, fleet, warning, peers)
       theme.muted
     ),
   })
+  -- The dot legend, where the header has room for it; the detail view always
+  -- carries one too.
+  if pr_store and pr_store.count > 0 then
+    local legend = legend_spans("   PRs ")
+    if spans_width(header.text[1]) + spans_width(legend) <= width then
+      for _, run in ipairs(legend) do
+        header.text[1][#header.text[1] + 1] = run
+      end
+    end
+  end
   -- Every peer that is not answering, by name; the rest are one count.
   if #peers > 0 then
     local fine = 0
@@ -718,6 +834,10 @@ function M.render(ctx, model, fuel, worker, fleet, warning, peers)
     end
   end
   local heading = { span(selected and " " .. selected.title or " No matching cards", theme.text) }
+  if selected and prs_of(selected) then
+    heading = add_dots({ span(" ") }, prs_of(selected))
+    heading[#heading + 1] = span(" " .. selected.title, theme.text)
+  end
   -- Whose request it is, beside its title, only where somebody was recorded.
   if selected and (selected.requested_by or "") ~= "" then
     heading[2] = span(" · by " .. selected.requested_by, theme.muted)
@@ -773,6 +893,7 @@ function M.render(ctx, model, fuel, worker, fleet, warning, peers)
       fuel_view,
       filters,
       { type = "box", len = board_height, children = bands },
+      outside,
       selected_panel,
       footer,
     },

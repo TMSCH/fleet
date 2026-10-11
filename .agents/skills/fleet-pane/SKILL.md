@@ -161,6 +161,14 @@ check` came back unplaced.
 ## 5. The F-key
 
 `Alt+K` toggles the full-screen, read-only Kanban board without a layout edit.
+Each task card with a watched pull request carries one coloured dot per PR on
+its publish line, from the shepherd's store (`fleet queue prs --records`):
+green ready, grey pending, red failing (`◉` conflicting), amber changes
+requested or open threads, accent merged, `○` closed, `◌` stale. Sessions
+shepherd adopted (no task) get an "Outside sessions" row; the record view
+(`d`) lists each PR with its checks, review and threads, and a legend. The
+legacy column draws the same dots in place of its `⇡`. A fleet whose shepherd
+never ran draws no dots and no error.
 It shares the column’s reader library. The overlay installs at
 `plugins/91_fleet_queue.lua`, preserving the combined plugin’s existing run
 trust; the optional legacy column installs at `plugins/92_fleet_queue.lua`

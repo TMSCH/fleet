@@ -474,3 +474,18 @@ def test_the_marks_and_the_page_actions_page_the_window():
 def test_column_and_fleet_selection_render_without_state_writes():
     render("44", "--readonly-state")
     render("44", "--readonly-state", "--leads", "two-named", "--selected", "s2,w9")
+
+
+def test_pr_dots_take_the_publish_glyphs_place_and_fit_in_30_columns():
+    """With the shepherd's store, each PR is one cell in its state's colour where
+    the `⇡` was, so the row says which PR is red and grows by no more than the
+    extra PRs. Without the store the row is exactly what it was."""
+    tones = render("44", "--prs", "--tones")
+    expect(tones, "bad,ok |    ●● #47 · green — yours to merge", "muted |    ● attested · !52 · open — review")
+    refute(tones, "⇡ #47")
+    narrow = render("30", "--prs")
+    widest = max(cells(line) for line in narrow.splitlines())
+    assert widest <= 30, f"a row is {widest} columns wide in a 30-column pane\n{narrow}"
+    expect(narrow, "●● #47")
+    assert render("44") == render("44", "--tones").replace(". | ", ""), "no store changed the column"
+    expect(render("44"), "⇡ #47")
