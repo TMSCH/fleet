@@ -273,6 +273,32 @@ def test_one_unverified_repository_holds_the_whole_task_open(two_pushes, queue_d
     assert verdicts == {both["first"]["work"]: "passed", both["second"]["work"]: "missing"}
 
 
+@pytest.mark.parametrize("unchanged", ["first", "second"])
+def test_a_push_with_a_no_change_repository_lands_and_releases_its_dependent(
+    two_pushes, queue_dir, unchanged
+):
+    both = two_pushes
+    topic = both["topic"]
+    ok(q("add", topic, "dependent", "--title", "Dependent",
+         "--repo", both["first"]["work"], "--branch", "fix/dependent", "--number", "02"))
+    fill_brief(queue_dir / topic / "02-dependent" / "BRIEF.md")
+    ok(q("block", f"{topic}/02-dependent", "--on", f"{topic}/01-commits-in-both",
+         "--kind", "semantic-dependency", "--why", "needs the published change"))
+    result_artifacts(both["dir"], "shipped", "One repository needed a change.", {
+        both[name]["work"]: (
+            "no change needed — already compatible" if name == unchanged
+            else both[name]["landed"]
+        ) for name in ("first", "second")
+    })
+
+    ok(q("collect", "--no-reap"))
+
+    doc = record(queue_dir, topic, "01-commits-in-both")
+    assert doc["artifact_check"]["verdict"] == "passed"
+    assert doc["state"] == "landed", doc
+    expect(ok(q("plan")).out.split("waiting:")[0], "02-dependent")
+
+
 def test_a_repository_the_result_names_nothing_for_is_held_open(two_pushes):
     """24c. A `shipped` claim with one repository left out is exactly a `shipped`
     claim with no artifact at all: there is nothing to check, and nothing proves
@@ -285,14 +311,17 @@ def test_a_repository_the_result_names_nothing_for_is_held_open(two_pushes):
 
 
 def test_allow_unverified_still_closes_a_task_that_spans_repositories(two_pushes, queue_dir):
-    """24c. The operator's override is not narrowed by any of this."""
+    """24c. The operator's override is not narrowed by any of this — but it
+    closes the task, it does not move the commit: one that never reached its
+    base branch is not a landing, so the task stays `done`."""
     both = two_pushes
     result_artifacts(both["dir"], "shipped", "Committed in both.", {
         both["first"]["work"]: f"https://github.com/acme/first/commit/{both['first']['landed']}",
         both["second"]["work"]: f"https://github.com/acme/second/commit/{both['second']['aside']}",
     })
-    expect(ok(q("collect", "--allow-unverified", "--no-reap")).out, "publish NOT verified")
-    assert record(queue_dir, both["topic"], "01-commits-in-both")["state"] == "landed"
+    ref = f"{both['topic']}/01-commits-in-both"
+    expect(ok(q("collect", "--allow-unverified", ref, "--no-reap")).out, "publish NOT verified")
+    assert record(queue_dir, both["topic"], "01-commits-in-both")["state"] == "done"
 
 
 # --- §24d: landing, and the blocker that must not clear early ----------------
