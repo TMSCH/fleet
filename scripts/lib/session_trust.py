@@ -34,6 +34,9 @@ It is safe to run only in the window between `session create` and the first
 `session send`, which is when `fleet queue dispatch` runs it: nothing
 has been typed into that pane yet, so there is no composer content to
 corrupt. Do not run it against a session that is already working.
+Queue sends do run it against live sessions, so they request visible-screen
+checks even when the agent's hook never reported: scrollback can quote a
+dialog that is not in front of the agent.
 
 IN-PROCESS, AND NO SHELL. `dispatch` calls `answer_dialogs` directly, and
 `fleet session-trust` runs this file. It needs thurbox-cli and Python and
@@ -289,9 +292,15 @@ def pane_text(uuid: str, lines: int = 60) -> str:
     return output if isinstance(output, str) else ""
 
 
-def pane(uuid: str) -> str:
-    """The captured pane squeezed for signatures that may wrap or lose spaces."""
-    return squeeze(pane_text(uuid))
+CODEX_COMPOSER = "› Ask Codex to do anything"
+
+# What Codex draws BELOW its empty composer, and nothing else may be there.
+# 0.156 drew one status line (`model · path · branch`); 0.161 adds `? for
+# shortcuts` under it, and a `⚠ 2 warnings · f2 to view` line when its config
+# raised any. Each is recognised by its own shape, so a line of transcript
+# after a quoted placeholder still is not a footer.
+CODEX_FOOTER = re.compile(r".* · .*|\? for shortcuts|⚠ .*\bwarnings?\b.*")
+CODEX_FOOTER_LINES = 3
 
 
 def codex_composer_ready(uuid: str) -> bool:
@@ -299,11 +308,16 @@ def codex_composer_ready(uuid: str) -> bool:
 
     Codex can be running before its startup hook reports. Its composer is the
     pane's own evidence that the trust gate is behind it. A mention of the
-    placeholder in older transcript text is not that evidence.
+    placeholder in older transcript text is not that evidence: the composer
+    line must be followed by at least one footer line and by footer lines
+    ONLY, no more of them than Codex draws.
     """
     tail = [line.strip() for line in pane_text(uuid).splitlines() if line.strip()]
-    return (len(tail) >= 2 and tail[-2] == "› Ask Codex to do anything"
-            and " · " in tail[-1])
+    if CODEX_COMPOSER not in tail:
+        return False
+    after = tail[len(tail) - tail[::-1].index(CODEX_COMPOSER):]
+    return (0 < len(after) <= CODEX_FOOTER_LINES
+            and all(CODEX_FOOTER.fullmatch(line) for line in after))
 
 
 def shows(signature: str, text: str) -> bool:
@@ -363,7 +377,9 @@ def taught_gates(agent_root: str, agent: str = "", only_named: bool = False) -> 
 # --- the whole handshake -----------------------------------------------------
 
 
-def answer_dialogs(session: str, timeout: int = 20, as_json: bool = False) -> tuple[int, str]:
+def answer_dialogs(
+    session: str, timeout: int = 20, as_json: bool = False, *, visible_only: bool = False
+) -> tuple[int, str]:
     """Confirm, answer and confirm every dialog in front of the agent.
 
     Returns the exit code and the one line of report, formatted for the
@@ -446,11 +462,20 @@ def answer_dialogs(session: str, timeout: int = 20, as_json: bool = False) -> tu
 
     is_codex = "codex" in agent_settings.chain(agent, conf)
 
+    # Sends can reach working agents whose hooks never reported. Their
+    # scrollback can quote a dialog just as a reported agent's can; only a
+    # menu still on screen is evidence that keys should be pressed.
+    visible_only = visible_only or info.get("hook_reported") is True
+
+    def view() -> str:
+        """The squeezed pane in which a dialog can still be in front of the agent."""
+        return squeeze(pane_text(uuid, lines=0 if visible_only else 60))
+
     def gate_on_pane() -> int | None:
         """The index of the gate the pane shows right now, if any."""
         if not gates:
             return None
-        text = pane(uuid)
+        text = view()
         for i, (signature, _keys) in enumerate(gates):
             if shows(signature, text):
                 return i
@@ -462,7 +487,7 @@ def answer_dialogs(session: str, timeout: int = 20, as_json: bool = False) -> tu
     def unanswerable_codex_folder_on_pane() -> bool:
         # A folder screen may leave the composer visible below it. A changed
         # selector or wording must block the brief, even though no gate matches.
-        return is_codex and shows(r"trust this folder\?", pane(uuid))
+        return is_codex and shows(r"trust this folder\?", view())
 
     def hook_review_blocked() -> tuple[int, str]:
         return 3, say(
@@ -490,7 +515,7 @@ def answer_dialogs(session: str, timeout: int = 20, as_json: bool = False) -> tu
         dialog being GONE is. On either failure nothing more is sent.
         """
         signature, keys = gates[i]
-        if keys == "down enter" and YES_SELECTED.search(pane(uuid)):
+        if keys == "down enter" and YES_SELECTED.search(view()):
             keys = "enter"
         for k in keys.split():
             if not send_key(uuid, k):
@@ -498,7 +523,7 @@ def answer_dialogs(session: str, timeout: int = 20, as_json: bool = False) -> tu
                                "send-failed")), keys
             time.sleep(1)
         for _ in range(10):
-            if not shows(signature, pane(uuid)):
+            if not shows(signature, view()):
                 return None, keys
             time.sleep(1)
         return (3, say(
