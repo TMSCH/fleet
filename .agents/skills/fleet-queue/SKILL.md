@@ -548,7 +548,8 @@ psmux tasks that request `attested` still need their existing publishing
 pipeline to write a current body attestation, or an explicit operator decision
 to reclassify each task and review it manually. Never rewrite those records
 or their PR bodies as part of a default change. Clean PRs remain outside
-Fleet auto-merge even where a repository is allowlisted.
+Fleet auto-merge without the independent review opt-in described in §5a,
+even where a repository is allowlisted.
 
 ```text
     topic/02-document-the-states  shipped  https://…/pull/1001  [publish verified: attested]
@@ -629,6 +630,38 @@ gets exactly one of these:
 | checks green, `MERGEABLE`, ours, nothing attested it | recorded `green`, reported `ready to merge — not attested; yours`, never merged by fleet |
 | anything it could not read | reported, left alone |
 
+**Optional independent review stays pending after publication.** The
+`REVIEW_REPOS`, `REVIEWER_TASK` and `REVIEW_SCORE` settings in
+`orchestration/publish.conf` opt repositories into an explicit review
+obligation. The tracked example owns the configuration and trust boundary;
+`scripts/lib/review_lifecycle.py` owns the lifecycle. Read them before enabling
+it. `collect` still proves artifact existence; green CI and a finished reviewer
+turn do not discharge the obligation. `queue plan --json` exposes `reviews`,
+including a missing reviewer or fixer, and the reconciler tells the lead.
+
+The configured reviewer receives actionable current-head work, safely and
+once per obligation and conversation. Findings go to the existing fixer;
+nobody is spawned by this contract. A push requires independent reassessment.
+The reviewer records the published forge summary from its own assigned session:
+
+```bash
+uv run --project <control-plane-checkout> fleet queue review record <PR-URL> --head <full-head> \
+  --score <score> --findings <count> --evidence <forge-summary-note-URL>
+```
+
+Use the control-plane project even from a separate reviewer worktree; the
+delivered command includes its path. A deliberate session stop preserves a
+completed clean assessment but blocks new recordings and wakes. Retiring or
+blocking its task, or an absent/unreadable census, invalidates the assessment.
+
+The reviewer remains held after its result is collected, for new heads and new
+PRs. Remove its assignment before retiring it. A clean assessment adds vetting
+evidence to the existing merge gate only in opted-in repositories; allowlists,
+CI, threads, author permission and human holds still apply. An `attested` task
+still needs its original publisher attestation. After changed feedback, absence,
+or an unreadable source, do not reuse an earlier score: finish the assessment of
+the current full head and record it again.
+
 **Review comments are a delivery of their own, not a condition.** Beside the
 row above — whatever it says, short of `CHANGES_REQUESTED`, a fixer this pass
 just sent, or a merge — `shepherd` reads every review, comment and thread on
@@ -678,7 +711,7 @@ merges only in the repositories the operator named in
 `orchestration/auto-merge.conf` — gitignored, absent by default, read every
 pass; the tracked `auto-merge.example.conf` names NOTHING and owns the gates a
 merge still clears (head branch in the repository, the opener can push there,
-an attestation naming the CURRENT head, every check concluded and passed,
+  vetting evidence naming the CURRENT head, every check concluded and passed,
 `MERGEABLE`). Entries are host-qualified. `FLEET_AUTO_MERGE_REPOS` in the
 environment REPLACES the file. Everywhere outside the list it reports `ready
 to merge` and stops. A `needs-human` rule on a line — `path:<glob>` or
@@ -718,8 +751,9 @@ uv run fleet queue prs --records  # the same, as the board's tab-separated wire
 
 Each `--records` PR carries one dot word: `merged`, `closed`, `stale` (marked
 stale, or not observed in two `SHEPHERD_SECS` passes), `failing`,
-`conflicting`, `changes` (changes requested or unresolved threads), `ready`
-(checks passing and mergeable) or `pending` — most decisive first.
+`conflicting`, `changes` (changes requested, unresolved threads or independent
+findings), `ready` (checks passing, mergeable and no required review pending)
+or `pending` — most decisive first.
 
 `shepherd` is a sibling of `collect`, not part of it: `collect` reads local
 files and works offline, and folding a session-spawning, forge-calling side
@@ -911,7 +945,7 @@ is also a setting: `<NAME>_SECS` in the gitignored
 restart` after an edit), with `FLEET_RECONCILE_<NAME>_SECS` still beating it.
 Two things are about you:
 
-- **It will type one line at you, and only ever about five things:** that N
+- **It will type one line at you about six things:** that N
   tasks are ready and nothing will dispatch them — treat it as `plan` already
   run, and `dispatch`; that N workers are STALLED — dispatched, at rest past
   half an hour, no `result.md`, no new commit: `show` the task, then `send` a
@@ -919,8 +953,11 @@ Two things are about you:
   five minutes ago and never handed the brief: look at the pane, then
   `fleet queue prompt <ref>`; that N workers NEED INPUT — they said so with
   `fleet queue declare <ref> needs-input --why …`: read the why in `plan`,
-  decide, and `send` the answer (a delivered `send` retires the question); or
-  that it fast-forwarded this checkout and you need `/update-fleet <sha>`.
+  decide, and `send` the answer (a delivered `send` retires the question); that
+  independent review obligations remain pending — read `plan --json`'s
+  `reviews`, restore any absent recipient and finish the current-head review
+  (§5a); or that it fast-forwarded this checkout and you need
+  `/update-fleet <sha>`.
   Once each, never mid-turn, and never into an input
   line that holds anything: that waits in your mailbox instead.
 - **A worker that declared `paused --until T` is waiting by design** (CI, a
