@@ -437,6 +437,10 @@ def no_terminal() -> dict:
     return {"start_new_session": True}
 
 
+# Tree termination and pipe draining each get this allowance, including on Windows.
+BOUNDED_CLEANUP_SECS = 10
+
+
 def terminate_tree(pid: int, force: bool = False) -> None:
     """End `pid` and what it is running, as a stop has to.
 
@@ -449,8 +453,9 @@ def terminate_tree(pid: int, force: bool = False) -> None:
     if WINDOWS:
         taskkill = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "taskkill.exe")
         try:
-            subprocess.run([taskkill, "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
-        except OSError:
+            subprocess.run([taskkill, "/PID", str(pid), "/T", "/F"], capture_output=True, check=False,
+                           timeout=BOUNDED_CLEANUP_SECS)
+        except (OSError, subprocess.TimeoutExpired):
             pass
         return
     sig = signal.SIGKILL if force else signal.SIGTERM
@@ -461,6 +466,52 @@ def terminate_tree(pid: int, force: bool = False) -> None:
             os.kill(pid, sig)
         except OSError:
             pass
+
+
+def run_bounded(argv: list[str], secs: float, input: str | None = None, on_start=None,
+                capture_output: bool = False, **popen) -> subprocess.CompletedProcess | None:
+    """`subprocess.run`, held to `secs`: past it the child AND what it started are ended.
+
+    None when the bound ran out. `subprocess.run(timeout=)` kills the child
+    alone, and a grandchild still holding its pipe — `thurbox-cli` under
+    `watch`, `gh` under `shepherd` — leaves the caller waiting on output that
+    never ends. So the child is started as the root of a tree `terminate_tree`
+    ends whole. POSIX: a session of its own, so the group IS that tree.
+    Windows: nothing extra, because `taskkill /T` already walks descendants.
+    `on_start` is handed the child's pid the moment it exists, for a caller
+    that must be able to end it from another process.
+    """
+    if capture_output:
+        popen["stdout"] = popen["stderr"] = subprocess.PIPE
+    if input is not None:
+        popen["stdin"] = subprocess.PIPE
+    if not WINDOWS:
+        popen["start_new_session"] = True
+    with subprocess.Popen(argv, **popen) as proc:
+        def cleanup():
+            terminate_tree(proc.pid, force=True)
+            try:
+                # Descendants can hold inherited pipes even after the root exits.
+                proc.communicate(timeout=BOUNDED_CLEANUP_SECS)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+        try:
+            if on_start:
+                on_start(proc.pid)
+        except BaseException:
+            cleanup()
+            raise
+        try:
+            out, errs = proc.communicate(input, timeout=secs)
+        except subprocess.TimeoutExpired:
+            cleanup()
+            return None
+        except BaseException:
+            cleanup()
+            raise
+
+    return subprocess.CompletedProcess(argv, proc.returncode, out, errs)
 
 
 def split_command(line: str, windows: bool = WINDOWS) -> list[str]:
