@@ -822,6 +822,36 @@ under them tracked, never a link (a shared store is somebody else's), and
 nothing in a worktree another session sits in. The rest of the worktree,
 uncommitted work included, stays.
 
+**What a worker started OUTSIDE its worktree is the operator's to take
+down.** A container stack, a database, a daemon keyed to the worktree belongs
+to a tool fleet neither names nor runs, and it outlives the directory — on one
+machine eleven such stacks held 26 GB keyed to worktrees that no longer
+existed. So `WORKTREE_RELEASED_CMD` in the gitignored
+`orchestration/reconcile.conf` (the tracked example sets it, like everything
+else there, to nothing) is a command run once per worktree reap lets go of,
+with that worktree's absolute path and the task's ref appended:
+
+```text
+    disk/01-build                  reaped     99999999-…  (idle)
+    disk/01-build                  released   /…/worktrees/fix-build  (WORKTREE_RELEASED_CMD)
+```
+
+It is refused where the build output is — a worktree somebody sits in, and one
+whose occupancy cannot be established — and a fixer's checkout only ever
+reaches it from the one place that takes that checkout back, so a removal git
+refuses over somebody's uncommitted work hands over nothing. It never holds a
+task open: a failure, a timeout past `WORKTREE_RELEASED_CMD_SECS` (60), or a
+line that is not a command is printed and the task lands all the same. It runs
+once per worktree per pass, however many release points reach it.
+`reap --dry-run` prints what it would run, except for that checkout, where it
+says it would hand it over rather than promise a command a refused removal
+cancels. In the `session delete --force` case the directory is already gone
+when the command runs, which is why it gets the path and not the directory.
+A session `notify` keeps below keeps its own worktree, so that one is not
+handed over — then or when you delete the session yourself, so run the teardown
+by hand for those. Its fixer's checkout is still taken back and handed over,
+because that is released on the task's state and not on its session.
+
 **Whether `landed` and `abandoned` delete the session is the operator's
 setting.** `ON_LANDED` and `ON_CLOSED` in the gitignored
 `orchestration/reconcile.conf` (the tracked `reconcile.example.conf` sets
