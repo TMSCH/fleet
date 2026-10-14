@@ -275,7 +275,8 @@ names every path and the reason for each.
   on first start. The loop's code is tracked; nothing it writes is.
 - `orchestration/shepherd/` — shepherd's runtime state: `prs.json`, the state
   of every pull request it watches, per session — a task's worker or a session
-  it adopted — and `briefs/`, the files the one-line messages to adopted
+  it adopted — plus, as `unwatched`, every other open one it saw, which no
+  session here is on; and `briefs/`, the files the one-line messages to adopted
   sessions point at. Written by `fleet queue shepherd`
   (`scripts/lib/shepherd_store.py`, whose docstring is the store's schema),
   read by `fleet queue prs [--json | --records]` (`--records` is the board's
@@ -516,8 +517,8 @@ a second copy — read the skill before you run any of it:
    held `threads-open` until each one is resolved, and a count the forge will
    not give is `undetermined`, never ready.
    It also **adopts sessions fleet did not spawn**: every local thurbox session
-   that is not a lead, is held by no task, descends from no lead, held
-   session or unlisted parent, and sits on a branch of its own with an open
+   that is not a lead or conductor, is held by no task, descends from no OTHER
+   fleet's lead or conductor, and sits on a branch of its own with an open
    change request is classified the same way and, for a condition shepherd
    acts on, sent ONE line pointing at a brief — at rest only, once per
    condition per head, and never a fixer or a merge of its own. Every pass

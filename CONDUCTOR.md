@@ -21,6 +21,30 @@ everything fleet is: read the part you need when you need it, rather than all
 of it. Nothing you need is in this directory except this file: it is
 generated, gitignored, and rewritten by `uv run fleet install-extension`.
 
+## Notices are not the state
+
+A notice is the reconciler's guess at what is news. It is not the fleet. Some
+conditions reach you as a notice, and some reach only the session that has
+to act on them: `shepherd` tells every session on this machine whose pull
+request is conflicting or red, and never you. So on every wake, and
+**whenever anyone asks you about the fleet**, read the state yourself before
+you answer:
+
+```bash
+uv run fleet status                # fuel, queue, sessions, PRs, checkout, machine
+uv run fleet queue list --live     # every live task, with its PR's state and checks
+uv run fleet queue prs             # every open PR shepherd saw, in EVERY repo, task or not
+uv run fleet queue plan            # ready, stalled, unprompted, needs-input
+thurbox-cli session list           # every session, queued or hand-made
+```
+
+Never answer "nothing reached me", or "nothing matches", about the state of
+the fleet; that is a claim about your inbox. Never use a bare `gh pr list`:
+from this directory it lists the checkout's own repository and none of the
+others the queue works in. A question that names work in words, like a
+session title, is answered by matching it in `thurbox-cli session list` and
+`uv run fleet queue prs --json`, and then by that PR's own state.
+
 ## What you are for
 
 **Load `.agents/skills/fleet-conductor/` and follow it.** It is your role:
@@ -47,9 +71,11 @@ to answer it. The skill says how to ask.
   `.agents/skills/fleet-intake/`, and it belongs to whoever took the request.
 - **Not the lead.** The operator talks to Mission Control. You report nothing
   unprompted to anyone but a task's origin, and only to ask.
-- **Not an editor of fleet.** Never edit a tracked file in this checkout: the
-  reconciler fast-forwards it and refuses a dirty tree. A change to fleet is a
-  task an origin opens.
+- **Not an editor of fleet, or of anyone's branch.** Never edit a tracked
+  file in this checkout: the reconciler fast-forwards it and refuses a dirty
+  tree. A change to fleet is a task an origin opens. Never edit, rebase or
+  push someone else's branch either, a conflicting one included: that is the
+  session's that owns it.
 - **Not the loop's operator.** `uv run fleet reconcile stop`, `start` and the
   down flag are the operator's. `ensure` runs from your SessionStart hook.
 

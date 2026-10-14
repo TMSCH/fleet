@@ -249,35 +249,36 @@ MIDDLE = "0e0e0e0e-0000-0000-0000-000000000005"
 PEER_LEAD = "\U0001f4e1 Mission Control · other-fleet"
 
 
-def test_a_worker_whose_lead_is_gone_is_still_not_adopted(outside, shep, stubs):
-    """Its parent is not listed: a lead deleted, or re-created under a new id. Unknown is not ours."""
-    session(stubs, LEAD, PEER_LEAD, "idle", None)  # the re-created lead, under a new id
+def test_a_session_whose_parent_is_gone_is_adopted(outside, shep, stubs):
+    """Its parent is not listed any more. Nothing says it is another fleet's, so it is told."""
+    session(stubs, LEAD, PEER_LEAD, "idle", None)  # another fleet's lead, but not this one's parent
     session(stubs, OUTSIDE, "hand-made", "idle", outside, "feat/outside")
     session_row(stubs, OUTSIDE, parent_session_id=GONE)
     out = q("shepherd").out
-    assert sends(stubs, OUTSIDE) == [], out
-    assert OUTSIDE not in store()["sessions"]
+    assert len(sends(stubs, OUTSIDE)) == 1, out
+    assert OUTSIDE in store()["sessions"]
 
 
 @pytest.mark.parametrize(("grandparent", "adopted"), [
     (PEER_LEAD, False),
-    (None, False),  # the grandparent is not listed
+    (None, True),  # the grandparent is not listed
     ("the operator's own session", True),
+    (LEAD_NAME, True),  # this fleet's own lead: its descendants are told, too
 ])
 def test_a_session_is_judged_by_its_whole_ancestry(outside, shep, stubs, grandparent, adopted):
-    """A worker's own child is still that fleet's: the chain is walked to its root."""
+    """Another fleet's worker's child is still that fleet's: the chain is walked to its root."""
     session(stubs, MIDDLE, "a worker's helper", "idle", None)
     session_row(stubs, MIDDLE, parent_session_id=LEAD if grandparent else GONE)
     if grandparent:
         session(stubs, LEAD, grandparent, "idle", None)
     session(stubs, OUTSIDE, "hand-made", "idle", outside, "feat/outside")
     session_row(stubs, OUTSIDE, parent_session_id=MIDDLE)
-    out = q("shepherd").out
+    out = q("shepherd", FLEET_LEAD_SESSION=LEAD_NAME).out
     assert len(sends(stubs, OUTSIDE)) == (1 if adopted else 0), out
     assert (OUTSIDE in store()["sessions"]) is adopted
 
 
-def test_a_child_of_this_queues_worker_is_left_to_that_worker(outside, shep, stubs, tmp_path):
+def test_a_child_of_this_queues_worker_is_told_itself(outside, shep, stubs, tmp_path):
     held = checkout(tmp_path / "held", "main-ish")
     topic = ok(q("topic", "add", "adoption", "--title", "Adoption",
                  "--prompt", "shepherd outside sessions")).stdout.strip()
@@ -289,17 +290,37 @@ def test_a_child_of_this_queues_worker_is_left_to_that_worker(outside, shep, stu
     session(stubs, OUTSIDE, "hand-made", "idle", outside, "feat/outside")
     session_row(stubs, OUTSIDE, parent_session_id=HELD)
     out = q("shepherd").out
-    assert sends(stubs, OUTSIDE) == [], out
-    assert OUTSIDE not in store()["sessions"]
+    assert len(sends(stubs, OUTSIDE)) == 1, out
+    assert OUTSIDE in store()["sessions"]
 
 
-def test_a_parent_cycle_is_not_adopted_and_does_not_hang(outside, shep, stubs):
+def test_a_child_on_the_workers_own_branch_is_not_told_about_the_tasks_pr(shep, stubs, tmp_path):
+    """The task's PR goes to the task's worker by the task's road, and to nobody else as well."""
+    held = checkout(tmp_path / "held", "main-ish")
+    topic = ok(q("topic", "add", "adoption", "--title", "Adoption",
+                 "--prompt", "shepherd outside sessions")).stdout.strip()
+    ok(q("add", topic, "held", "--title", "A task's own worker", "--repo", str(held),
+         "--branch", "feat/held", "--number", "01"))
+    git("checkout", "-q", "-b", "feat/held", cwd=held)
+    session(stubs, HELD, "queued worker", "idle", held, "feat/held")
+    ok(q("attach", f"{topic}/01-held", HELD))
+    helper = checkout(tmp_path / "helper", "feat/held")
+    session(stubs, OUTSIDE, "the worker's helper", "idle", helper, "feat/held")
+    session_row(stubs, OUTSIDE, parent_session_id=HELD)
+    shep.pr(202, headRefName="feat/held", body="", statusCheckRollup=[FAILED])
+    out = q("shepherd").out
+    refute("\n".join(sends(stubs, OUTSIDE)), "PR #202")
+    assert OUTSIDE not in store()["sessions"], out
+    assert store()["sessions"][HELD]["prs"][0]["number"] == 202
+
+
+def test_a_parent_cycle_does_not_hang(outside, shep, stubs):
     session(stubs, MIDDLE, "loop", "idle", None)
     session_row(stubs, MIDDLE, parent_session_id=OUTSIDE)
     session(stubs, OUTSIDE, "hand-made", "idle", outside, "feat/outside")
     session_row(stubs, OUTSIDE, parent_session_id=MIDDLE)
     out = q("shepherd").out
-    assert sends(stubs, OUTSIDE) == [], out
+    assert len(sends(stubs, OUTSIDE)) == 1, out
 
 
 def test_a_session_spanning_two_repositories_is_told_about_each(shep, stubs, tmp_path):

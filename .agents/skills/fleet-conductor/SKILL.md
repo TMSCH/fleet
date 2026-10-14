@@ -1,6 +1,6 @@
 ---
 name: fleet-conductor
-description: 'Keep a fleet''s queued and dispatched work moving from the background: act on the reconciler''s ready, stalled, unprompted, needs-input, review and sync notices — dispatch, re-prompt, refuel, block on a condition — and escalate to a task''s origin whatever is not the conductor''s to decide. Use when you are the fleet''s conductor session, when a notice from the fleet reconciler reaches you, or when asked what keeps fleet''s work moving between the moments someone talks to it.'
+description: 'Keep a fleet''s queued and dispatched work moving from the background: read the fleet''s state itself on every wake, act on the reconciler''s ready, stalled, unprompted, needs-input, review and sync notices — dispatch, re-prompt, refuel, block on a condition — and escalate to a task''s origin whatever is not the conductor''s to decide. Use when you are the fleet''s conductor session, when a notice from the fleet reconciler reaches you, when anyone asks the conductor about the state of the fleet''s work, PRs or sessions, or when asked what keeps fleet''s work moving between the moments someone talks to it.'
 user-invocable: true
 allowed-tools: Read, Bash, Glob, Grep
 ---
@@ -33,6 +33,36 @@ context**: what the person asked, what they already ruled out. A brief that
 looks wrong to you may be exactly what was asked. A task that looks dead may
 be waiting on something only its origin knows. So both are a question, and
 the question goes where the answer is.
+
+## Reading the state, before any notice
+
+**Notices are a subset, and the state is not.** The reconciler tells you what
+it judges news. `shepherd` tells the session on a pull request — a task's
+worker, or any other session on this machine — when it goes conflicting, red
+or changes-requested, and never you. So, on every wake and whenever anyone
+asks about the fleet, read:
+
+```bash
+uv run fleet status                # every section; its PRS line says how many no task holds
+uv run fleet queue list --live     # each live task with its PR's state, checks and threads
+uv run fleet queue prs             # every open PR in EVERY repo the queue names, task or not
+uv run fleet queue plan            # ready, stalled, unprompted, needs-input
+thurbox-cli session list           # every session, the hand-made ones included
+```
+
+- **Answer from that reading, never from your inbox.** "No notice reached me"
+  is true and useless. Asked about a merge conflict, read `queue prs` and say
+  which pull request conflicts, whose session it is on, and what was done.
+- **Every repository, never one.** A bare `gh pr list` from here lists the
+  checkout's own repository only. `queue prs` lists every repository the
+  queue's tasks name, plus each one a local session's branch is on. Ask a
+  forge directly only with `-R <owner>/<repo>` for one you already found there.
+- **Work named in words** — "the session keys work" — is a session title or a
+  PR title. Match it in `thurbox-cli session list` and
+  `uv run fleet queue prs --json`, then read that PR. A session with no task is
+  still in `prs`, under its own name, once shepherd adopted it.
+- **Say what you could not read.** A `STALE` entry, an `INCOMPLETE` line or
+  an unreadable forge is part of the answer, never a "nothing".
 
 ## Reading a notice
 
@@ -146,6 +176,10 @@ lost: the next notice about that task is not a reason to ask it again.
 
 - **Edit a tracked file in this checkout.** The reconciler fast-forwards it
   and refuses a dirty tree; a change to fleet is a task an origin opens.
+- **Edit, rebase or push somebody else's branch**, a conflicting one above
+  all. It is the session's that owns it, and its origin's to decide.
+- **Answer a question about the fleet from the notices alone.** Read the state
+  first, as above.
 - **Read another codebase.** A second file in another repository is a brief,
   and briefs are an origin's to write.
 - **Message a worker through its mailbox, or the lead with a wake.** `send`

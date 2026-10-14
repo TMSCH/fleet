@@ -424,7 +424,7 @@ def probe_prs(tasks: list) -> dict:
     produce a sentence rather than an empty list that reads as "nothing is
     open". `scripts/lib/forge.py` decides which forge answers.
     """
-    sec: dict = {"unavailable": None, "prs": [], "errors": []}
+    sec: dict = {"unavailable": None, "prs": [], "errors": [], **unwatched_reading()}
     # A remote task's `repo` is a path on its host, so asking a forge CLI here
     # would ask the wrong filesystem and report "no such directory" about a
     # checkout that exists. Skipped and SAID, rather than turned into an error that reads as
@@ -480,6 +480,20 @@ def probe_prs(tasks: list) -> dict:
     sec["errors"] += remote
     sec["prs"].sort(key=lambda p: p["ref"])
     return sec
+
+
+def unwatched_reading() -> dict:
+    """What shepherd's last pass saw that this section cannot: PRs no task holds.
+
+    This section matches change requests to TASKS, so a pull request nobody
+    queued — a hand-made session's, a colleague's — is not on it, and "none
+    open for these tasks" read as "none open" to a conductor asked about one.
+    So it says how many more the shepherd store holds and names the command
+    that lists them. A read of the store only; it asks no forge.
+    """
+    doc, _why = fleetqueue.shepherd_store().load(fleetqueue)
+    adopted = sum(len(x.get("prs") or []) for x in (doc.get("sessions") or {}).values() if x.get("adopted"))
+    return {"adopted": adopted, "unwatched": len(doc.get("unwatched") or [])}
 
 
 def _task_prs(repo: str, crs: list, owners: list) -> list:
@@ -1510,7 +1524,16 @@ def render_prs(sec: dict) -> list:
         lines.append(f"    {p['slug']:<24} {p['checks']:<8} {p['branch'] or '':<32} {p['ref']}")
     for e in sec["errors"]:
         lines.append(f"    {e['repo']}: {e['reason']}")
+    lines += render_unwatched(sec)
     return lines
+
+
+def render_unwatched(sec: dict) -> list:
+    adopted, unwatched = sec.get("adopted") or 0, sec.get("unwatched") or 0
+    if not adopted and not unwatched:
+        return []
+    return [f"    + {adopted + unwatched} more that no task holds: {adopted} on sessions shepherd adopted, "
+            f"{unwatched} that no session here is on — uv run fleet queue prs"]
 
 
 def render_checkout(sec: dict) -> list:
@@ -1760,6 +1783,7 @@ def collect() -> dict:
     queue = probe_queue()
     tasks = all_tasks(queue)
     _load_lib("fleet_preflight", "preflight.py")  # loaded here, never half-loaded under a second thread
+    fleetqueue.shepherd_store()  # the same, for probe_prs's read of the store
     fuel, sessions, prs, checkout, machine = at_once(
         (probe_fuel_all,), (probe_sessions, tasks), (probe_prs, tasks), (probe_checkout,), (probe_machine,))
     return {
