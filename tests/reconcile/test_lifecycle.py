@@ -238,13 +238,18 @@ def test_a_supervisor_whose_runtime_directory_is_deleted_exits(recon):
     supervisor = int(recon.pid())
     mod = lib("reconcile.py")
 
-    shutil.rmtree(recon.rt)
+    # Take the path away in one step. A recursive delete races the live loop,
+    # which can write a file after the scan and fail the final rmdir; the
+    # moved copy is only deleted once the loop has exited.
+    removed = recon.rt.with_name("removed-runtime")
+    recon.rt.rename(removed)
 
     assert wait_for(lambda: not mod.fleet_platform.alive(supervisor), ORPHAN_SECS), (
         "the supervisor kept ticking with its runtime directory gone")
     # Nothing in a pass may make it again: the loop would then read as at home
     # at the next boundary and never exit.
     assert not recon.rt.exists(), "the loop made its runtime directory again instead of exiting"
+    shutil.rmtree(removed)
 
 
 def test_a_directory_somebody_else_made_is_not_the_loops_own(isolated_env):
