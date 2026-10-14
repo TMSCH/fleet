@@ -1549,6 +1549,27 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def stamp_datetime(stamp) -> datetime | None:
+    """A timestamp as a datetime, or None for anything unreadable.
+
+    Two spellings reach the records: this file's own ISO-8601 text, and the
+    `at` of a thurbox event, which `watch` copies verbatim and thurbox emits as
+    epoch MILLISECONDS — read as text, every folded transition was time 0
+    (#251). A bare number above 1e11 is milliseconds, below it seconds.
+    Naive text comes back naive, so each caller keeps its own reading of it.
+    """
+    if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+        secs = stamp / 1000 if stamp > 1e11 else stamp
+        try:
+            return datetime.fromtimestamp(secs, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    try:
+        return datetime.fromisoformat(str(stamp))
+    except ValueError:
+        return None
+
+
 def age_of(stamp) -> str:
     """How long ago, as one short token — or "" for anything unreadable.
 
@@ -1556,9 +1577,8 @@ def age_of(stamp) -> str:
     cadence, so a state observed forty minutes ago has to look forty minutes
     old wherever it is drawn, rather than reading as what is true now.
     """
-    try:
-        then = datetime.fromisoformat(str(stamp))
-    except (TypeError, ValueError):
+    then = stamp_datetime(stamp)
+    if then is None:
         return ""
     if then.tzinfo is None:
         then = then.replace(tzinfo=timezone.utc)
@@ -9227,15 +9247,14 @@ def stale_since(age: float) -> float:
 
 
 def record_time(stamp) -> float:
-    """One of this file's own `at` timestamps as an epoch second.
+    """A record's `at` — ISO text or a thurbox epoch, as `stamp_datetime`
+    reads it — as an epoch second.
 
     Unreadable reads as the beginning of time, which makes an unparseable
     receipt fall through to the ordinary path rather than block it.
     """
-    try:
-        return datetime.fromisoformat(str(stamp)).timestamp()
-    except (TypeError, ValueError):
-        return 0.0
+    then = stamp_datetime(stamp)
+    return then.timestamp() if then else 0.0
 
 
 # --- the accounts one pass reads ---------------------------------------------
@@ -12808,7 +12827,8 @@ def last_transition(task: Task) -> tuple[str | None, str]:
     `at` is when thurbox says the session changed state; `observed` is when
     `watch` folded it in. The first is what answers "has this worker moved",
     so a fold that happens to run after the message cannot manufacture
-    movement that predates it.
+    movement that predates it. thurbox's epoch `at` comes back as ISO text,
+    the spelling every other `at` this queue hands out has.
     """
     path = task.file(PROGRESS_FILE)
     if not os.path.exists(path):
@@ -12826,7 +12846,8 @@ def last_transition(task: Task) -> tuple[str | None, str]:
         stamp = ev.get("at")
         when = record_time(stamp)
         if when and (newest is None or when > newest[0]):
-            newest = (when, str(stamp))
+            text = stamp if isinstance(stamp, str) else datetime.fromtimestamp(when, timezone.utc).isoformat()
+            newest = (when, text)
     return (newest[1] if newest else None), ""
 
 
