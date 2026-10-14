@@ -1659,6 +1659,7 @@ TASK_RECORD = "task.yaml"
 PROMPT_FILE = "PROMPT.md"
 BRIEF_FILE = "BRIEF.md"
 RESULT_FILE = "result.md"
+PREVIOUS_RESULT_FILE = "result.previous.md"
 PROGRESS_FILE = "progress.jsonl"
 # The lock beside a record is the record's own path plus this.
 LOCK_SUFFIX = ".lock"
@@ -4123,6 +4124,10 @@ class PosixShell:
         quoted = shlex.quote(path)
         return f"mkdir -p -- {quoted} && chmod 700 -- {quoted}"
 
+    def set_aside(self, src: str, dst: str) -> str:
+        quoted = shlex.quote(src)
+        return f"mv -f -- {quoted} {shlex.quote(dst)} 2>/dev/null; [ ! -e {quoted} ]"
+
     def remove(self, path: str, names: list) -> str:
         files = " ".join(shlex.quote(self.join(path, n)) for n in names)
         return f"rm -f -- {files} && rmdir -- {shlex.quote(path)}"
@@ -4289,6 +4294,15 @@ class PowerShell:
             "$ErrorActionPreference = 'Stop'\n"
             f"New-Item -ItemType Directory -Force -Path {ps_quote(path)} | Out-Null\n"
             "Write-Output 'fleet-dir'\n"
+        )
+
+    def set_aside(self, src: str, dst: str) -> str:
+        quoted = ps_quote(src)
+        return (
+            "$ErrorActionPreference = 'Stop'\n"
+            f"if (Test-Path -LiteralPath {quoted} -PathType Leaf) "
+            f"{{ Move-Item -LiteralPath {quoted} -Destination {ps_quote(dst)} -Force }}\n"
+            "Write-Output 'fleet-set-aside'\n"
         )
 
     def remove(self, path: str, names: list) -> str:
@@ -4636,6 +4650,14 @@ def settle_remote(task: Task, entry: dict) -> tuple[bool, str]:
     if proc.returncode != 0:
         return False, (f"could not make {beside} on {entry['destination']}: "
                        f"{first_line(proc) or 'no output'}")
+    # The host's half of what `attach` does here: a re-dispatch on the same
+    # branch gets the same worktree, and the previous attempt's result.md
+    # beside it would be fetched as this attempt's verdict (#258).
+    proc = ssh_run(entry, shell.set_aside(shell.join(beside, RESULT_FILE),
+                                          shell.join(beside, PREVIOUS_RESULT_FILE)), login=False)
+    if proc.returncode != 0:
+        return False, (f"could not move the previous result.md aside in {beside} on "
+                       f"{entry['destination']}: {first_line(proc) or 'no output'}")
     repo = remote_identity(entry, str(task.doc["repo"]))
     files = [
         (BRIEF_FILE, read_text(task.file(BRIEF_FILE))),
@@ -5379,6 +5401,18 @@ def attach(task: Task, session: str, agent: str = "", prompted: bool = False) ->
     (#117): before it, `add` recorded only an agent the operator had NAMED, and
     a task that named none left every later reader to re-derive its own.
     """
+    # A NEW ATTEMPT STARTS WITH NO RESULT. A task put back to `queued` by hand
+    # keeps the previous attempt's result.md, and once this marks it
+    # dispatched `collect` would read that file as this attempt's verdict
+    # (#258). It is moved aside, not deleted: it is still the record of what
+    # the last attempt said.
+    stale = task.file(RESULT_FILE)
+    if task.state == "queued":
+        if os.path.exists(stale):
+            os.replace(stale, task.file(PREVIOUS_RESULT_FILE))
+        # And where the last attempt's result was fetched from: `settle_remote`
+        # records this attempt's, so nothing pulls the old one in between.
+        task.doc.pop("remote", None)
     if agent:
         task.doc["agent"] = agent
     task.doc["session"] = session
@@ -6473,7 +6507,17 @@ def _read_result(task: Task) -> tuple | None:
     Every reason it is None that a person should see is printed.
     """
     path = task.file(RESULT_FILE)
-    if task.state in CONCLUDED_STATES and task.state not in REREAD_STATES:
+    # Only a task with a worker has a result to read. A `queued` one has none
+    # yet, so a result.md beside it is a previous attempt's, left there when
+    # the task was put back by hand: reading it would close work that never
+    # ran, and land it once that old pull request merged.
+    if task.state not in ("dispatched", *REREAD_STATES):
+        if task.state == "queued" and os.path.exists(path):
+            print(
+                f"    {task.ref}: is queued, so its result.md is not read — no worker has"
+                f" run since it was written; dispatch moves it to {PREVIOUS_RESULT_FILE}",
+                file=sys.stderr,
+            )
         return None
 
     # The remote transport, and the whole of it. A worker on another machine

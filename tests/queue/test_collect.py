@@ -13,9 +13,9 @@ import shutil
 
 import pytest
 import yaml
-from queuekit import ok, result, result_artifacts
+from queuekit import S2, ok, result, result_artifacts
 
-from harness import REPO, expect, git, queue_module, refute, squeezed, write
+from harness import REPO, expect, git, queue_module, refute, squeezed, stream_event, write
 from harness import run_queue as q
 
 PR = "https://github.com/acme/app/pull/"
@@ -92,6 +92,30 @@ def test_shipped_with_no_pull_request_is_a_claim_and_not_a_skip(topic, queue_dir
     show = q("show", f"{topic}/05-ship-without-proof").out
     refute(show, "state:       done")
     expect(show, "missing")
+
+
+def test_a_queued_task_is_not_closed_by_a_result_it_never_wrote(briefed, stubs, queue_dir):
+    # 02 never had a session, so no worker wrote this: it is a previous attempt's
+    # file, left behind when the task was put back to `queued` by hand.
+    stubs.pipeline_pr(998, "fix/document-the-states")
+    # Written straight to disk: `result` would give the task the worker it lacks.
+    write(queue_dir / briefed / "02-document-the-states" / "result.md",
+          "---\noutcome: shipped\nartifact: https://github.com/Thurbeen/thurbox/pull/998\n---\n"
+          "Documented the state vocabulary.\n")
+
+    out = q("collect").out
+    refute(out, "pull/998  [publish verified")
+    expect(out, "02-document-the-states", "queued", "not read")
+    expect(q("show", f"{briefed}/02-document-the-states").out, "state:       queued")
+
+    # Dispatching it again is a new attempt, and the old file is not its result.
+    stubs.stream(stream_event(100, S2, "working", event="present"))
+    ok(q("attach", f"{briefed}/02-document-the-states", S2))
+    task = queue_dir / briefed / "02-document-the-states"
+    assert not (task / "result.md").exists(), "dispatch moves the previous attempt's result aside"
+    assert "pull/998" in (task / "result.previous.md").read_text(encoding="utf-8")
+    refute(q("collect").out, "pull/998")
+    expect(q("show", f"{briefed}/02-document-the-states").out, "state:       dispatched")
 
 
 # --- 8b. the publish METHOD: declared at intake, verified at collect -----------
@@ -304,7 +328,7 @@ def test_allow_unverified_closes_only_the_tasks_it_names(ptopic, push_repo, queu
     out = ok(q("collect", "--allow-unverified", f"{ptopic}/12-astray-one", "--no-reap")).out
     expect(out, "12-astray-one", "closed by --allow-unverified", "1 task(s) HELD OPEN")
     assert state_of(queue_dir, f"{ptopic}/12-astray-one") == "done"
-    assert state_of(queue_dir, f"{ptopic}/13-astray-two") == "queued"
+    assert state_of(queue_dir, f"{ptopic}/13-astray-two") == "dispatched"
 
 
 def test_allow_unverified_refuses_a_ref_that_names_no_task(ptopic):
@@ -557,7 +581,7 @@ def test_collect_accepts_verified_origin_base(tmp_path, rtopic, queue_dir, stubs
     right = yaml.safe_load((queue_dir / rtopic / "01-right" / "task.yaml").read_text(encoding="utf-8"))
     wrong = yaml.safe_load((queue_dir / rtopic / "02-wrong" / "task.yaml").read_text(encoding="utf-8"))
     assert right["state"] == "done", right
-    assert wrong["state"] == "queued", wrong
+    assert wrong["state"] == "dispatched", wrong
 
 
 @pytest.mark.parametrize("case,base", [
@@ -591,4 +615,4 @@ def test_collect_does_not_strip_unverified_base_prefixes(
            "https://github.com/acme/first/pull/1330")
     expect(q("collect", "--no-reap").out, "NOT CLOSED", "onto main")
     doc = yaml.safe_load((queue_dir / rtopic / "01-unverified" / "task.yaml").read_text(encoding="utf-8"))
-    assert doc["state"] == "queued", doc
+    assert doc["state"] == "dispatched", doc
