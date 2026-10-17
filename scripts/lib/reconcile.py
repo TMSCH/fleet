@@ -753,10 +753,28 @@ def run_queue(cfg: Config, args: list, merge: bool = True, loop: bool = True) ->
     return done.returncode, done.stdout
 
 
+# How much of a failed child's last line `status` keeps, and where a longer one
+# is cut: in the MIDDLE, so both ends survive. The one line a script that is
+# not there leaves — `<interpreter>: can't open file '<path>': [Errno 2] No
+# such file or directory` — is two absolute paths with the file's name and the
+# reason at its END, and on a macOS framework Python (which names itself by its
+# `Python.app` path, 131 characters) under pytest-xdist's temp directory those
+# paths passed 300 characters before the name, so `status` said the missing
+# notifier was `…/notify_con`. A longer cap would only move that cliff.
+LAST_WORDS_CHARS = 300
+LAST_WORDS_CUT = " … "
+
+
 def last_words(text: str) -> str:
     """A failed child's last non-blank line: almost always the one that says why."""
     lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
-    return lines[-1][:300] if lines else ""
+    if not lines:
+        return ""
+    line = lines[-1]
+    if len(line) <= LAST_WORDS_CHARS:
+        return line
+    keep = (LAST_WORDS_CHARS - len(LAST_WORDS_CUT)) // 2
+    return line[:keep] + LAST_WORDS_CUT + line[-keep:]
 
 
 def child_went(cfg: Config, label: str, why: str = "") -> None:

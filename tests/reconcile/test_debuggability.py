@@ -144,6 +144,30 @@ def test_a_notifier_that_is_not_there_is_in_status_not_only_the_log(recon, here)
     expect(status.out, "failing   notify", "time(s) since", "notify_conductor.py")
 
 
+def test_a_long_last_line_is_cut_in_the_middle_and_keeps_the_reason_at_its_end():
+    """The line a script that is not there leaves is two absolute paths with the
+    file's name and the reason at its END. Cut from the front at the cap, it
+    named the missing notifier `…/notify_con` wherever the interpreter's and
+    the temp directory's paths together reached the cap first — a macOS
+    framework interpreter under pytest-xdist — and the test above held or fell
+    by one character of path. Pinned here on paths of a length no machine's
+    decide."""
+    from harness import lib
+
+    mod = lib("reconcile.py")
+    interpreter = "/" + "i" * 130 + "/Python"
+    path = "/" + "t" * 200 + "/checkout/scripts/lib/notify_conductor.py"
+    line = f"{interpreter}: can't open file '{path}': [Errno 2] No such file or directory"
+    assert len(line) > mod.LAST_WORDS_CHARS
+
+    words = mod.last_words("Traceback, say\n" + line + "\n\n")
+
+    assert len(words) <= mod.LAST_WORDS_CHARS
+    expect(words, interpreter[:40], "notify_conductor.py': [Errno 2] No such file or directory", mod.LAST_WORDS_CUT)
+    assert mod.last_words("fine\nshort and whole\n") == "short and whole"
+    assert mod.last_words("") == ""
+
+
 def test_a_failed_plan_is_said_and_a_recovery_clears_it(recon, monkeypatch):
     """`plan` failing used to be silent: no notice, and not one log line."""
     monkeypatch.setenv("RECON_FAIL", "plan")
