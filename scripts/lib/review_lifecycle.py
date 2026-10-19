@@ -6,6 +6,8 @@ score. Empty REVIEW_REPOS disables this contract. Misconfiguration never passes.
 There is no default reviewer, publisher, review tool or repository.
 
 Each PR has one runtime record under shepherd/reviews, protected by an OS lock.
+It holds the assessment the gate reads and, as `rounds`, every one recorded
+before it — head, score, findings, state, at — which the task's trace reads.
 Publication and CI do not attest a review. Only `queue review record`, run from
 the configured reviewer's live session, can record an assessment. It requires a
 full current head and a readable, linked forge summary containing that head.
@@ -69,6 +71,10 @@ def directory(q):
 
 
 _RECORD_SUFFIX = ".json"
+
+# Rounds kept per change request: far past any review that converges, and a
+# bound on a record a loop re-reads every pass.
+MAX_ROUNDS = 100
 
 
 def path(q, url):
@@ -343,11 +349,32 @@ def record(q, args):
                              "feedback": digest, "evidence": args.evidence,
                              "score": args.score, "findings": args.findings,
                              "state": "clean" if clean else "findings", "at": q.now()}
+        keep_round(doc)
         doc.update(url=cr.url, repo=cr.repo.qualified, head=args.head,
                    state=doc["assessment"]["state"], action="recorded", reviewer_task=pol["task"])
         q.fleet_platform.write_record(filename, json.dumps(doc) + "\n")
     print(f"review {doc['state']}: {cr.url} at {args.head}")
     return 0
+
+
+def rounds(q, url):
+    """Every review round recorded on one change request, oldest first: `rounds`,
+    or the one `assessment` a record from before `rounds` kept. The one reader
+    other modules use, so the record's path and shape stay this module's."""
+    doc = read(path(q, url))
+    kept = doc.get("rounds")
+    if not isinstance(kept, list) or not kept:
+        kept = [doc["assessment"]] if isinstance(doc.get("assessment"), dict) else []
+    return [r for r in kept if isinstance(r, dict) and r.get("at")]
+
+
+def keep_round(doc):
+    """The assessment is what the gate reads, and a new head replaces it; every
+    round stays in `rounds`, for the task's trace (telemetry.py)."""
+    rounds = doc.get("rounds")
+    rounds = rounds if isinstance(rounds, list) else []
+    rounds.append({k: doc["assessment"][k] for k in ("head", "score", "findings", "state", "at")})
+    doc["rounds"] = rounds[-MAX_ROUNDS:]
 
 
 def pending(q):

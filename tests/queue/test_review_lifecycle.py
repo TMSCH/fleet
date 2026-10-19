@@ -134,6 +134,23 @@ def test_findings_reach_resting_fixer_and_fix_needs_independent_reassessment(lif
     assert pass_(t)[0]["review"]["state"] == "clean"
 
 
+def test_every_recorded_round_is_kept_for_the_tasks_trace(lifecycle):
+    """A new head replaces the assessment the merge gate reads, and the rounds
+    before it stay: review rounds to 5/5 is a number only they can give."""
+    from harness import lib
+
+    t = lifecycle
+    pass_(t)
+    ok(record(t, score=4, findings=1))
+    t.shep.update(201, headRefOid="b" * 40)
+    pass_(t)
+    ok(record(t, head="b" * 40))
+    doc = json.loads(Path(lib("review_lifecycle.py").path(lib("queue.py"), PR)).read_text(encoding="utf-8"))
+    assert [(r["head"], r["score"], r["findings"], r["state"]) for r in doc["rounds"]] == [
+        (HEAD, 4, 1, "findings"), ("b" * 40, 5, 0, "clean")]
+    assert all(r["at"] for r in doc["rounds"])
+
+
 def test_clean_review_uses_existing_merge_gates_and_merge_cleans_obligation(lifecycle):
     t = lifecycle
     pass_(t)
@@ -481,3 +498,20 @@ def test_stopped_reviewer_cannot_complete_or_be_woken_for_a_new_head(lifecycle):
     assert row["review"]["state"] == "pending"
     assert row["review"]["action"] == "needs-lead"
     assert not t.sends(REVIEWER)
+
+
+def test_rounds_reads_every_round_or_the_one_assessment_an_older_record_kept(lifecycle):
+    from harness import lib
+
+    queue = lib("queue.py")
+    review = lib("review_lifecycle.py")
+    assert review.rounds(queue, PR) == []
+    t = lifecycle
+    pass_(t)
+    ok(record(t, score=4, findings=1))
+    assert [(r["score"], r["state"]) for r in review.rounds(queue, PR)] == [(4, "findings")]
+    path = Path(review.path(queue, PR))
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc.pop("rounds")
+    write(path, json.dumps(doc) + "\n")
+    assert [(r["score"], r["state"]) for r in review.rounds(queue, PR)] == [(4, "findings")]
