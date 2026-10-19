@@ -13,7 +13,9 @@ read (`context.py ... --wire json`), and `.slow` holds the seconds either takes
 first.
 `.windows` hands the command to `windows_host`, which answers only what a
 PowerShell 5 sshd answers. `.origin` holds what `git remote get-url origin`
-prints there, and `.origins.json` what it prints per checkout path. `mkdir -p`/`chmod`, `rm -f`/`rmdir`, `mv -f` and `cat >` behave as a
+prints there, and `.origins.json` what it prints per checkout path; a base
+fetch succeeds wherever one of those names an origin, unless `.nofetch` holds
+git's failure, and an upstream is always unset. `mkdir -p`/`chmod`, `rm -f`/`rmdir`, `mv -f` and `cat >` behave as a
 shell does: a write into a directory that does not exist fails. `.realshell` RUNS the script with `sh -c`, the way
 sshd runs an account's login shell, with HOME at `<dest>.home` and only the
 system's PATH — POSIX only.
@@ -32,6 +34,23 @@ from fleet_stubs import called, windows_host
 
 def unquote(path: str) -> str:
     return re.sub(r"'$", "", re.sub(r"^'", "", path))
+
+
+def named_origin(state, dest: str, script: str) -> str | None:
+    """What `git remote get-url origin` prints for the checkout `script` names.
+
+    `.origins.json` maps a checkout path to its own origin, for a task spanning
+    repositories; `.origin` is every other path's. Longest first, so `/a/b` is
+    not answered for `/a/bc`; matched as text because a login shell wraps the
+    script in a second quoting.
+    """
+    origins = state / f"{dest}.origins.json"
+    named = json.loads(origins.read_text(encoding="utf-8")) if origins.is_file() else {}
+    path = next((p for p in sorted(named, key=len, reverse=True) if p in script), None)
+    if path is not None:
+        return named[path]
+    origin = state / f"{dest}.origin"
+    return origin.read_text(encoding="utf-8") if origin.is_file() else None
 
 
 def main() -> int:
@@ -80,22 +99,26 @@ def main() -> int:
             sys.stdout.write("no-dir")
             return 1
         sys.stdout.write("ok")
+    elif "fleet-fetched" in script:
+        # A base fetch: `.nofetch` holds what git says when it fails, and a
+        # checkout with no origin here fails the way git does.
+        nofetch = state / f"{dest}.nofetch"
+        said = nofetch.read_text(encoding="utf-8") if nofetch.is_file() else ""
+        if not said and named_origin(state, dest, script) is None:
+            said = "fatal: 'origin' does not appear to be a git repository\n"
+        if said:
+            sys.stderr.write(said)
+            sys.stdout.write("fleet-fetch-failed")
+            return 1
+        sys.stdout.write("fleet-fetched")
+    elif "fleet-no-upstream" in script:
+        sys.stdout.write("fleet-no-upstream")
     elif "remote get-url origin" in script:
-        # `.origins.json` maps a checkout path to its own origin, for a task
-        # spanning repositories; `.origin` is every other path's.
-        origins = state / f"{dest}.origins.json"
-        named = json.loads(origins.read_text(encoding="utf-8")) if origins.is_file() else {}
-        # Longest first, so `/a/b` is not answered for `/a/bc`; matched as
-        # text because a login shell wraps the script in a second quoting.
-        path = next((p for p in sorted(named, key=len, reverse=True) if p in script), None)
-        if path is not None:
-            sys.stdout.write(named[path])
-            return 0
-        origin = state / f"{dest}.origin"
-        if not origin.is_file():
+        origin = named_origin(state, dest, script)
+        if origin is None:
             sys.stderr.write("error: No such remote 'origin'\n")
             return 2
-        sys.stdout.write(origin.read_text(encoding="utf-8"))
+        sys.stdout.write(origin)
     elif script.startswith("mkdir -p -- "):
         words = shlex.split(script)
         target = remotes / dest / words[3].lstrip("/")

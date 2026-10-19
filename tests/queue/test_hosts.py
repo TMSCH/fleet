@@ -353,6 +353,45 @@ def test_a_remote_command_runs_in_a_login_shell_and_moving_bytes_does_not(hosts,
     refute(moved, "Welcome to profilebox")
 
 
+@pytest.mark.parametrize("host,dest,repo,tree", [
+    ("devbox", "me@devbox", "/srv/code/app", WORKTREE),
+    ("winbox", "me@winbox", WINREPO, WWORKTREE),
+])
+def test_an_origin_base_is_fetched_on_the_host_and_tracks_nothing_there(
+    rtopic, hosts, queue_dir, host, dest, repo, tree
+):
+    """The fetch and the unset run where the checkout is, in the shell it
+    speaks; a fetch that fails there refuses the task with git's own words."""
+    stubs = hosts.stubs
+    ok(q("add", rtopic, "fresh-there", "--title", "Fresh there", "--repo", repo, "--host", host,
+         "--branch", "fix/fresh-there", "--base", "origin/main", "--number", "40"))
+    write(queue_dir / rtopic / "40-fresh-there" / "BRIEF.md", "Build it from a fresh base.\n")
+    write(hosts.state / f"{dest}.origin", "git@github.com:acme/app.git\n")
+    write(hosts.state / f"{dest}.nofetch", "fatal: Could not read from remote repository.\n")
+    expect(q("dispatch").out,
+           f"NOT SPAWNED — {repo}: could not fetch origin/main: fatal: Could not read from remote repository.")
+    assert creates(stubs) == []
+
+    (hosts.state / f"{dest}.nofetch").unlink()
+    worktrees = [{"repo_path": repo, "worktree_path": tree, "branch": "fix/fresh-there"}]
+    write(stubs.root / "next-session.json", json.dumps({"id": RSESSION, "created": True, "worktrees": worktrees}))
+    hosts.session(RSESSION, name="Fresh there", state="working", agent="claude", hook_reported=True,
+                  worktrees=worktrees)
+    ok(q("dispatch"))
+    expect(creates(stubs)[-1], "--base-branch origin/main")
+    sent = hosts.read_flag(dest, "commands") if host == "winbox" else "\n".join(stubs.calls("ssh"))
+    # The fetch and the upstream check, each by the first line it is sent with.
+    expect(sent, "fleet-fetch-failed", "@{upstream}")
+
+
+def test_every_single_quote_powershell_reads_is_doubled():
+    """PowerShell takes U+2018 to U+201B for `'` too, so a path carrying one
+    must not end the literal and run what follows."""
+    path = "C:\\work\\fix-\u2019; calc; \u2019"
+    assert queue_module("print(q.ps_quote(sys.argv[1]))", path).strip() == \
+        "'C:\\work\\fix-\u2019\u2019; calc; \u2019\u2019'"
+
+
 def test_a_windows_host_misdeclared_as_tmux_is_caught_at_the_first_probe(hosts):
     """The tripwire logs any command that is not `-EncodedCommand`; this proves
     it fires, so its silence in the next test means something."""

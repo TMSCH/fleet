@@ -58,6 +58,19 @@ def main(argv: list) -> int:
             print("github.com|`gh`")
             return 1
         print("github.com with an ssh key")
+    elif "fleet-fetched" in body:
+        if flag("nofetch"):
+            with open(os.path.join(state, f"{dest}.nofetch"), encoding="utf-8") as fh:
+                sys.stderr.write(fh.read())
+            print("fleet-fetch-failed")
+            return 1
+        if not flag("origin"):
+            sys.stderr.write("fatal: 'origin' does not appear to be a git repository\n")
+            print("fleet-fetch-failed")
+            return 1
+        print("fleet-fetched")
+    elif "fleet-no-upstream" in body:
+        print("fleet-no-upstream")
     elif "remote get-url origin" in body:
         origin = os.path.join(state, f"{dest}.origin")
         if not os.path.isfile(origin):
