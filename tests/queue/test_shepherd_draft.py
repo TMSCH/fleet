@@ -10,12 +10,14 @@ still just a draft.
 """
 
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from kit_display import set_field
 from kit_shepherd import repo
 from queuekit import PUBLISH_CONF, ok
-from test_shepherd_comments import ME, PR, Talk, author, talk_on
+from test_shepherd_comments import ME, PR, WORKER, Talk, author, talk_on
 
 from harness import expect, git, refute, write
 from harness import run_queue as q
@@ -123,6 +125,71 @@ def test_the_flip_is_one_way_and_a_person_who_undoes_it_wins(draft):
     out = draft.pass_()
     expect(out, "left-alone", "it is a draft again")
     assert shep.readied() == [201] and shep.merged() == [], out
+
+
+def ago(minutes: int) -> str:
+    return (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+
+
+def concluded(talk: Talk, minutes_ago: int | None) -> None:
+    set_field(talk.queue_dir, f"{talk.topic}/01-talk", "concluded_at",
+              "" if minutes_ago is None else ago(minutes_ago))
+
+
+def test_a_draft_no_check_reaches_is_flipped_once_its_task_has_been_concluded_ten_minutes(draft):
+    # CI that runs only on ready_for_review, or on paths this diff misses,
+    # starts on the flip: waiting for a check here is waiting forever.
+    shep = draft.shep
+    shep.update(201, statusCheckRollup=[])
+    for anchor in (None, 9):
+        concluded(draft, anchor)
+        out = draft.pass_()
+        expect(out, "no check has reported yet")
+        assert shep.readied() == [], out
+
+    # Concluded long ago, but a fixer went in minutes ago: its push may simply
+    # not have registered its checks yet. A refusal sent nobody anything.
+    concluded(draft, 60)
+    ref = f"{draft.topic}/01-talk"
+    set_field(draft.queue_dir, ref, "shepherd",
+              {"condition": "checks-failed", "session": WORKER, "pr": PR, "at": ago(3)})
+    expect(draft.pass_(), "no check has reported yet")
+    set_field(draft.queue_dir, ref, "shepherd",
+              {"condition": "checks-failed", "refused": "policy", "pr": PR, "at": ago(3)})
+    set_field(draft.queue_dir, ref, "shepherd_comments", {PR: {"sent": ["C1"], "at": ago(3)}})
+    expect(draft.pass_(), "no check has reported yet")
+    set_field(draft.queue_dir, ref, "shepherd_comments", {PR: {"sent": ["C1"], "at": ago(11)}})
+    shep.update(201, mergeable="UNKNOWN")
+    expect(draft.pass_(), "no check has reported yet")
+    assert shep.readied() == []
+
+    # The lead's own send is something to push too, once it landed: a draft
+    # flipped three minutes after "also rename the flag" ran review on the
+    # wrong code. One that never reached the worker restarts nothing.
+    shep.update(201, mergeable="MERGEABLE")
+    ok(q("send", ref, "Also rename the flag."))
+    assert draft.task()["sends"][-1]["delivered"] is True
+    expect(draft.pass_(), "no check has reported yet")
+    assert shep.readied() == []
+    sends = draft.task()["sends"]
+    sends[-1]["at"] = ago(11)
+    sends.append(dict(sends[-1], at=ago(3), delivered=False))
+    set_field(draft.queue_dir, ref, "sends", sends)
+
+    expect(draft.pass_("--dry-run"), "would-mark-ready", "no check configured after 10 minutes")
+    out = draft.pass_()
+    expect(out, "marked-ready", "no check configured after 10 minutes")
+    assert shep.readied() == [201], out
+    assert shep.merged() == [], out
+    assert draft.task()["publish"]["detail"] == (
+        "marked ready for review with no check configured after 10 minutes; gated as usual next pass"
+    )
+
+    # Out of draft, no check is no pass: the merge waits for the checks the flip starts.
+    out = draft.pass_()
+    expect(out, "no check has reported yet")
+    assert shep.merged() == [], out
+    assert shep.readied() == [201], out
 
 
 def test_a_refused_flip_is_reported_and_retried_next_pass(draft):

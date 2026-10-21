@@ -2980,8 +2980,9 @@ def _draft_brief_line(task: Task, method: str) -> str:
         "- **Draft.** Open the pull request as a DRAFT (`gh pr create --draft`,"
         " `glab mr create --draft`) and never mark it ready yourself: CI and the"
         " review bots go first, and `shepherd` marks it ready for review once"
-        " every check passed, nothing is left to fix and no review thread is"
-        " open.",
+        " every check passed (or, where none is configured, ten minutes after"
+        " you conclude or were last sent anything), nothing is left to fix and"
+        " no review thread is open.",
         width=78,
         subsequent_indent="  ",
     )
@@ -10629,6 +10630,22 @@ def may_auto_merge(repo: forge.RepoId) -> bool:
 # downstream jobs and people listen for — once it would otherwise be `ready`:
 # every check passed on its head, no fixer condition, no unresolved thread.
 #
+# NO CHECK AT ALL, ONCE THE WORKER IS DONE, PASSES THE FLIP AND ONLY THE FLIP.
+# A repository whose CI is path-filtered, or runs only on `ready_for_review`,
+# gives a draft that touches none of those paths no check while it is a draft:
+# waiting for one deadlocks, because what it waits for starts on the flip
+# (one sat until a person flipped it by hand, and its checks appeared within
+# seconds). So a mergeable draft with no check DRAFT_NO_CHECK_GRACE_SECS
+# after its worker last had reason to push is flipped, and says so in its
+# record. The merge rule is untouched: after the flip it is no longer a draft,
+# `_merge_readiness` still reads no check as no pass, and the checks the flip
+# started gate it. "Last had reason to push" is the latest of the task's
+# `concluded_at`, the last fixer or relayed comments shepherd sent into it for
+# this pull request, and the lead's last DELIVERED `fleet queue send`: a push
+# answering any of them can sit checkless for the minute GitHub takes to
+# register its suites, and that is not "no check configured". A task with no
+# `concluded_at` is never flipped this way.
+#
 # ONLY A TASK'S OWN DRAFT. A draft nobody's task records is a person's work in
 # progress, and "still a draft" is still the whole answer about it.
 #
@@ -10666,6 +10683,31 @@ def draft_listed(repo: forge.RepoId | None) -> bool:
 def draft_phase(cr: forge.ChangeRequest, task) -> bool:
     """Is this pull request a task's draft that shepherd takes out of draft itself?"""
     return bool(task) and cr.state == "open" and cr.draft and draft_listed(cr.repo)
+
+
+# GitHub registers a check suite for a matching workflow within a minute or
+# two of a push; ten minutes past that is a repository with nothing to run.
+DRAFT_NO_CHECK_GRACE_SECS = 10 * 60
+DRAFT_UNCHECKED = f"no check configured after {DRAFT_NO_CHECK_GRACE_SECS // 60} minutes"
+
+
+def draft_without_checks(cr: forge.ChangeRequest, task) -> bool:
+    """Has this draft's worker had nothing to push for DRAFT_NO_CHECK_GRACE_SECS?"""
+    concluded = aware_time(task.doc.get("concluded_at"))
+    if not concluded:
+        return False
+    fixer = rec_for(task, cr.url)
+    last = max(
+        concluded,
+        # A refusal is recorded too, and sent nobody anything to push.
+        aware_time(fixer.get("at")) if fixer.get("session") else 0.0,
+        aware_time(comments_record(task, cr.url).get("at")),
+        # The lead's own `fleet queue send`, once it landed: words the worker
+        # may well answer with a push. One that was not delivered reached nobody.
+        max((aware_time(s.get("at")) for s in task.doc.get("sends") or []
+             if isinstance(s, dict) and s.get("delivered")), default=0.0),
+    )
+    return time.time() - last >= DRAFT_NO_CHECK_GRACE_SECS
 
 
 def draft_flipped(task, url: str) -> dict:
@@ -11594,6 +11636,9 @@ def classify(cr: forge.ChangeRequest, method: str | None) -> tuple[str, str]:
     return _merge_readiness(cr, pending, attested, attest_why)
 
 
+NO_CHECK_YET = "no check has reported yet"
+
+
 def _merge_readiness(cr: forge.ChangeRequest, pending: list, attested: bool,
                      attest_why: str) -> tuple[str, str]:
     """`classify` past every fixable condition: `ready`, or why not yet."""
@@ -11604,7 +11649,7 @@ def _merge_readiness(cr: forge.ChangeRequest, pending: list, attested: bool,
         # so a PR whose checks have not been created yet reads exactly like a
         # PR with nothing to run — and merging the first one merges code CI
         # never saw. "No check has reported" is its own answer.
-        return "undetermined", "no check has reported yet"
+        return "undetermined", NO_CHECK_YET
     if cr.mergeable != "mergeable":
         # An unsaid answer is the forge still computing the merge, not a verdict.
         return "undetermined", (
@@ -12246,7 +12291,7 @@ def shepherd_pr(cr: forge.ChangeRequest, task, args) -> dict:
         return row
 
     if condition == "ready" and cr.draft:
-        return _shepherd_mark_ready(cr, task, args, row, rec)
+        return _shepherd_mark_ready(cr, task, args, row, rec, detail == DRAFT_UNCHECKED)
     if condition == "ready":
         return _shepherd_ready(cr, task, args, row, rec, word, method, review)
 
@@ -12273,6 +12318,9 @@ def _shepherd_classify(cr: forge.ChangeRequest, task, args, method, review) -> t
         # review is not asked: its reviewer cannot record on a draft, and it
         # starts on the first pass after the flip.
         condition, detail = classify(dataclasses.replace(cr, draft=False), method)
+        if (detail == NO_CHECK_YET and cr.mergeable == "mergeable"
+                and draft_without_checks(cr, task)):
+            condition, detail = "ready", DRAFT_UNCHECKED
         if condition == "ready":
             condition, detail = threads_gate(cr, detail)
         return condition, detail, None
@@ -12365,7 +12413,8 @@ def _shepherd_ready(cr: forge.ChangeRequest, task, args, row: dict, rec: dict,
     return _shepherd_merge(cr, task, row, method, review)
 
 
-def _shepherd_mark_ready(cr: forge.ChangeRequest, task, args, row: dict, rec: dict) -> dict:
+def _shepherd_mark_ready(cr: forge.ChangeRequest, task, args, row: dict, rec: dict,
+                         unchecked: bool) -> dict:
     """A task's draft every gate clears: take it out of draft, once. Never merged here.
 
     Not merged in the same pass, because "ready for review" is what starts the
@@ -12384,7 +12433,10 @@ def _shepherd_mark_ready(cr: forge.ChangeRequest, task, args, row: dict, rec: di
         return row
     if args.dry_run:
         row["action"] = "would-mark-ready"
-        row["note"] = "every check passed, nothing to fix, no open thread"
+        row["note"] = (
+            f"{DRAFT_UNCHECKED if unchecked else 'every check passed'}, nothing to fix, "
+            "no open thread"
+        )
         return row
     which, why = forge.for_repo(cr.repo)
     done, note = which.mark_ready(cr) if which else (False, why)
@@ -12395,7 +12447,11 @@ def _shepherd_mark_ready(cr: forge.ChangeRequest, task, args, row: dict, rec: di
         every[cr.url] = {"head": cr.head_sha, "at": now()}
         task.doc["shepherd_ready"] = every
         task.save()
-        record_publish(task, "draft", "marked ready for review; gated as usual next pass",
+        said = f" with {DRAFT_UNCHECKED}" if unchecked else ""
+        row["note"] = note + said
+        # "marked ready for review" stays the prefix: readers outside fleet
+        # match on it.
+        record_publish(task, "draft", f"marked ready for review{said}; gated as usual next pass",
                        "shepherd")
     return row
 
