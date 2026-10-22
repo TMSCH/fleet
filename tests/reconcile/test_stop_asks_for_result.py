@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -168,3 +169,107 @@ def test_a_bad_setting_still_exits_zero_and_still_asks(tmp_path, isolated_env):
     assert out.code == 0, out.out
     expect(out.stderr, "could not nudge", "is not a whole number")
     expect(json.loads(out.stdout)["reason"], str(task / "result.md"))
+
+
+# A worker WAITING ON PURPOSE says so with `fleet queue declare`, and its brief
+# tells it to before its turn ends. Blocking that stop asked a question the
+# worker had already answered, on every turn the wait lasted.
+
+def declare(*argv: str):
+    out = run_fleet("queue", "declare", REF, *argv)
+    assert out.code == 0, out.out
+    return out
+
+
+@pytest.mark.parametrize("said", [["paused", "--until", "1h", "--why", "CI is running"],
+                                  ["needs-input", "--why", "which base?"]])
+def test_a_worker_that_declared_its_wait_stops(tmp_path, isolated_env, said):
+    worker(tmp_path)
+    declare(*said)
+    out = stop()
+    assert out.code == 0, out.out
+    assert out.stdout.strip() == "", "a declared wait was blocked anyway"
+    assert nudged(isolated_env)
+
+
+def test_an_expired_pause_is_asked_again(tmp_path, isolated_env):
+    task = worker(tmp_path)
+    write(task / "progress.jsonl", json.dumps({
+        "declare": {"state": "paused", "until": "2026-01-01T01:00:00+00:00", "why": "CI"},
+        "observed": "2026-01-01T00:00:00+00:00",
+    }) + "\n")
+    out = stop()
+    assert out.code == 0, out.out
+    assert json.loads(out.stdout)["decision"] == "block", "a pause past its time still held"
+
+
+# Asked ONCE per head: `stop_hook_active` only spares the stop that follows a
+# block, so a worker resting across many turns was blocked on every one of them.
+
+def test_the_same_head_is_asked_about_once(tmp_path, isolated_env):
+    worker(tmp_path)
+    assert json.loads(stop().stdout)["decision"] == "block"
+    assert stop(active=True).stdout.strip() == ""
+    again = stop()
+    assert again.code == 0, again.out
+    assert again.stdout.strip() == "", "the next turn's stop was blocked over the same head"
+
+
+def test_a_new_commit_is_asked_about_again(tmp_path, isolated_env):
+    task = worker(tmp_path)
+    assert json.loads(stop().stdout)["decision"] == "block"
+    git(tmp_path / "wt", "commit", "-q", "--allow-empty", "-m", "more work")
+    out = stop()
+    assert out.code == 0, out.out
+    expect(json.loads(out.stdout)["reason"], str(task / "result.md"))
+
+
+def later(seconds: int = 120) -> str:
+    """A committer date past anything `declare` wrote this second."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(time.time() + seconds))
+
+
+def test_work_committed_after_a_declaration_is_asked_about(tmp_path, isolated_env):
+    """A declaration speaks for the work it was written over, not for what came after:
+    a worker pinged out of its pause commits a fix and stops without its result."""
+    task = worker(tmp_path)
+    declare("paused", "--until", "2h", "--why", "CI is running")
+    assert stop().stdout.strip() == ""
+    done = run(["git", "-C", str(tmp_path / "wt"), "commit", "-q", "--allow-empty", "-m", "the fix"],
+               GIT_COMMITTER_DATE=later())
+    assert done.code == 0, done.out
+    out = stop()
+    assert out.code == 0, out.out
+    expect(json.loads(out.stdout)["reason"], str(task / "result.md"))
+
+
+def test_a_new_commit_in_an_additional_repository_is_asked_about_again(tmp_path, isolated_env):
+    task = worker(tmp_path)
+    second = tmp_path / "second"
+    second.mkdir()
+    git(second, "init", "-q", "-b", "main")
+    git(second, "commit", "-q", "--allow-empty", "-m", "base")
+    git(second, "switch", "-q", "-c", BRANCH)
+    record = json.loads((task / "task.yaml").read_text(encoding="utf-8"))
+    write(task / "task.yaml", json.dumps(record | {"add_repos": [str(second)]}))
+    assert json.loads(stop().stdout)["decision"] == "block"
+    assert stop().stdout.strip() == ""
+    git(second, "commit", "-q", "--allow-empty", "-m", "more work")
+    out = stop()
+    assert out.code == 0, out.out
+    expect(json.loads(out.stdout)["reason"], str(task / "result.md"))
+
+
+def test_a_memory_that_cannot_be_written_still_asks(tmp_path, isolated_env):
+    """Forgetting costs a second question; failing to remember must not cost the first."""
+    task = worker(tmp_path)
+    write(isolated_env / "reconcile" / "stop-asked", "a file where the directory goes\n")
+    out = stop()
+    assert out.code == 0, out.out
+    expect(json.loads(out.stdout)["reason"], str(task / "result.md"))
+
+
+def test_the_question_names_a_declare_command_that_runs(tmp_path, isolated_env):
+    worker(tmp_path)
+    reason = json.loads(stop().stdout)["reason"]
+    expect(reason, f"fleet queue declare {REF} paused --until", "--why", "needs-input --why")
