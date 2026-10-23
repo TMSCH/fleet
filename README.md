@@ -7,6 +7,57 @@
 
 # fleet
 
+## Stable: Python v1.0.0
+
+**Use the pinned v1.0.0 release for stable Fleet.** `main` is the development
+branch for v2.0.0 beta, whose design contains only Task and its task
+controller. V2 is not a stable release and has different CLI, configuration
+and data formats. There is no automatic v1 migration.
+
+For a new stable installation, install git and
+[uv](https://docs.astral.sh/uv/getting-started/installation/), then run these
+commands on Linux or Windows PowerShell:
+
+```text
+git clone --branch v1.0.0 --single-branch https://github.com/Thurbeen/fleet.git fleet-v1
+uv run --project fleet-v1 fleet install
+```
+
+The tag checkout is detached deliberately: it stays at the frozen Python
+release rather than following `main`. Keep this directory; the extension
+records its path.
+
+**Existing users following `main` must pin v1 before updating.** In your
+existing Python Fleet checkout, preserve your operator state and resolve any
+tracked edits before switching; do not force the checkout:
+
+```text
+git fetch origin tag v1.0.0
+git switch --detach v1.0.0
+uv run fleet install
+```
+
+These commands keep the checkout in place and do not migrate its queue or
+configuration. The detached checkout prevents ordinary sync from following
+`main`. This freeze also includes a v1 major-version boundary: SessionStart
+and reconciler sync, and both v1 installers, inspect the fetched candidate
+before checkout or fast-forward. They refuse a missing or non-v1
+`FLEET_MAJOR` marker, or missing Python entry points, and leave the existing
+checkout and data unchanged. A fresh v1 installer also checks before writing
+candidate files. To reinstall a pinned checkout, use `uv run fleet install`
+there rather than the branch-tracking bootstrap.
+
+**Unpatched clients must install this freeze before v2 lands.** They can
+otherwise pull v2 through their old automatic sync or installer. Documentation
+alone cannot protect old code, and a manual `git pull` bypasses the guard.
+Pin the tag explicitly using the commands above; do not run development
+installers over a stable checkout.
+
+To inspect v2 deliberately, use a separate clone of `main` and follow its
+README. [PR #308](https://github.com/Thurbeen/fleet/pull/308) is the unmerged
+Task/controller beta candidate; v1 queues and configuration are not v2
+inputs. Keep beta configuration and data separate from v1.
+
 fleet is a control plane over [thurbox](https://github.com/Thurbeen/thurbox),
 a terminal UI for agent sessions. It maps your repositories and runs a task
 queue: you give it a goal, it splits the goal into tasks, and it runs one worker
@@ -60,7 +111,11 @@ fuel, which stays hidden by default. Filters and navigation are read-only.
 
 The installer gets uv itself. `uv run fleet preflight` lists anything missing.
 
-## Install
+## Development installation
+
+These unpinned installers follow `main`, the v2 development channel. Use the
+pinned stable instructions above for v1. While #308 remains unmerged, `main`
+still contains Python; it is not a promise of future v1 compatibility.
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Thurbeen/fleet/main/install.sh | sh

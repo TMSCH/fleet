@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import json
 import shlex
+
+import pytest
 import shutil
 from pathlib import Path
 
@@ -382,3 +384,34 @@ def test_the_json_report_of_a_refusal_moves_nothing_and_raises_nothing(tmp_path)
     expect(report["message"], "the tree is dirty")
     assert report["actions"] == {}
     assert report["before"] == report["after"] == ""
+
+
+@pytest.mark.parametrize("replacement", ["removed-python", "major-bump", "missing-marker"])
+def test_v1_sync_blocks_main_that_deletes_python_before_fast_forward(tmp_path, replacement):
+    work = new_repo(tmp_path)
+    before = head_of(work)
+    up = tmp_path / "publisher"
+    git("clone", "--quiet", str(tmp_path / "origin.git"), str(up), cwd=tmp_path)
+    if replacement == "removed-python":
+        git("rm", "-r", "fleet", "scripts", "pyproject.toml", cwd=up)
+    elif replacement == "major-bump":
+        write(up / "FLEET_MAJOR", "2\n")
+        git("add", "FLEET_MAJOR", cwd=up)
+    else:
+        git("rm", "FLEET_MAJOR", cwd=up)
+    write(up / "Cargo.toml", "# v2 replaces Python\n")
+    git("add", "Cargo.toml", cwd=up)
+    git("commit", "--quiet", "-m", "v2 replacement", cwd=up)
+    git("push", "--quiet", "origin", "main", cwd=up)
+    state = work / "orchestration" / "queue" / "private-result.md"
+    write(state, "keep\n")
+    git("check-ignore", "orchestration/queue/private-result.md", cwd=work)
+
+    for args in ((), ("--json",)):
+        done = run_fleet("sync-checkout", *args, cwd=work)
+        assert done.code == 0, done.out
+        assert head_of(work) == before, "breaking main replaced the v1 checkout"
+        expect(done.out, "v1 update blocked", "v1.0.0", "separate clone")
+        assert not (work / "Cargo.toml").exists()
+        assert (work / "scripts/lib/sync_checkout.py").is_file()
+        assert state.read_text(encoding="utf-8") == "keep\n"
