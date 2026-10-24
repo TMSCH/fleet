@@ -36,7 +36,7 @@ perform resource mutations.
 ## Desired state, observations and effects
 
 The [Task controller documentation](task-controller/README.md) defines
-the [resource](task-controller/resource.md),
+the [resource](resources/task.md),
 [state machine](task-controller/state-machine.md) and
 [interface](task-controller/interface.md).
 
@@ -44,6 +44,7 @@ One reconcile of a due Task follows this protocol:
 
 ```text
 read Task + resourceVersion
+  -> resolve/freeze referenced execution in private store before first effect
   -> ask pure controller for probes
   -> renew lease before each runtime probe
   -> pass observations + time to pure controller
@@ -110,6 +111,11 @@ Thurbox owns host connections and session execution. Fleet calls it through
 bounded processes; the fake runtime provides persisted fault injection for
 isolated tests. Runtime operations report their worst-case duration so the
 CLI can reject a lease too short to outlast them.
+
+TaskConfig and EnvProvider are passive data; the manager resolves providers
+through the existing runtime port and bounded executor before freezing a
+private launch snapshot. TaskController stays pure and owns the lifecycle.
+See [execution configuration](resources/task-config.md).
 
 ## Scope and compatibility
 
