@@ -97,6 +97,49 @@ refused. `shipped` is a worker's claim: Fleet does not verify a forge artifact.
 The next reconcile changes phase to `Concluded`; it does not release the
 session until the Task is deleted.
 
+## Planned additions
+
+Design, not implemented. The [Forge controller](../forge-controller/README.md)
+design adds the pieces below to the Task. None is served by the installed
+binary.
+
+| Field or verb | Owner | Meaning |
+| --- | --- | --- |
+| `spec.forge` | `apply`; mutable like `dispatch` | Optional overrides of the `[forge]` defaults: `relay.notes`, `relay.checks`, `draft.policy` (a name under `[forge.readyPolicies]`, refused if undefined; `null` disables mark-ready). Field-level: absent fields inherit. |
+| `status.declared` | `worker`, through `fleet declare` | Facts the worker declared, each a JSON object with a required string `kind` and nothing else validated. `--change-request URL` writes `{kind: "ChangeRequest", url, name}` and ensures the named ChangeRequest exists; `--json` writes any object. Accepted after the brief has a receipt and before deletion; a repeated URL is a no-op; it concludes nothing. |
+| `status.forge` | ForgeController | One entry per declared change, keyed by ChangeRequest name: its `uid`, `cursor`, `gaps`, mark-ready record and `notBefore`; plus this controller's conditions. Empty for a Task that declared nothing. |
+| `status.inbox` | Typed append by `fleet send TASK TEXT` or the Forge controller; typed remove by TaskController | Messages for the running session: `{key, from, text, about, queuedAt}`. Duplicate keys are refused. More than 20 undelivered entries raise `NeedsAttention/InboxFull` and further appends are refused. |
+| `status.deliveries` | TaskController | The newest 100 receipts by inbox key, plus per source the highest revision delivered, which is what keeps a duplicate out after a receipt rotates. The entry leaves `inbox` once receipted. |
+
+The [Forge controller interface](../forge-controller/interface.md#fields-this-controller-reads-and-owns)
+defines every field of `status.declared`, `status.forge` and `status.inbox`,
+with an example of a Task following two changes.
+
+Any Task may declare a change, with or without a `spec.forge` block; the
+standing worker policy tells every worker to open its change as a draft, to
+declare it, and to end every post on it with
+`<!-- fleet:worker <task uid> -->` on its own line, which is how Fleet tells
+the worker's words from a person's on the same account and one worker's from
+another's. Those three rules are the worker's to keep: a change opened ready
+is never marked ready, a change never declared is never followed, and a post
+without the mark comes back to its author as feedback. Nothing forge-related
+has to be created in advance, and a second Task may declare a change another
+Task opened.
+
+TaskController delivers inbox entries as it delivers the brief, oldest
+first, one per pass: only to a session observed ready on that pass, under
+the entry's key as the runtime intent key, journaled by the runtime, at most
+3 sends, then a receipt. An entry that exhausts its sends raises
+`NeedsAttention/DeliveryFailed` and stays queued behind nothing: later
+entries are still delivered. A Concluded Task with a nonempty inbox is due
+again, as the [Task state machine](../task-controller/state-machine.md#planned-additions)
+describes; a readable lookup that no longer shows its session is
+`WorkerGone` and `NeedsAttention`, never a respawn. No new finalizer and no
+owner reference: a ChangeRequest outlives the Tasks that follow it, and
+deleting a Task deletes nothing else. The
+[Forge controller interface](../forge-controller/interface.md#store-port-and-write-ownership)
+lists the resulting writers.
+
 ## Commands
 
 ```sh
