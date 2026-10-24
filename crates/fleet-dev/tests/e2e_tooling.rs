@@ -941,7 +941,7 @@ fn the_gate_never_rebuilds_the_binary_it_runs_from() {
 
 #[test]
 fn v2_installs_only_when_a_version_is_named() {
-    // Fleet v1 is the frozen default; v2 is a beta a user opts into by naming
+    // Fleet v1 stays frozen; v2 is installed by explicitly naming
     // its version. The installer never resolves "latest", which could be v1.
     let e = Env::new();
     install_fixture(&e);
@@ -966,4 +966,188 @@ fn the_tree_declares_fleet_major_2() {
     let marker = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../FLEET_MAJOR");
     let text = fs::read_to_string(&marker).expect("a root FLEET_MAJOR file");
     assert_eq!(text, "2\n", "FLEET_MAJOR must be exactly \"2\\n\"");
+}
+
+#[test]
+fn stable_tag_release_requires_main_ancestry_version_and_readiness() {
+    let e = Env::new();
+    e.repo();
+    e.write("Cargo.toml", "[workspace.package]\nversion = '2.0.0'\n");
+    e.write(".github/release-readiness.toml", "ready = true\n");
+    e.commit("feat: stable release");
+    e.git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    e.git(&["tag", "v2.0.0"]);
+    let args = ["release", "plan", "--ref", "refs/tags/v2.0.0"];
+    let (ok, out) = e.call(&args, &[]);
+    assert!(
+        ok && out.contains("publish=true") && out.contains("version=v2.0.0"),
+        "{out}"
+    );
+    assert!(
+        out.contains("newest=true"),
+        "first stable tag is latest: {out}"
+    );
+    let (ok, out) = e.call(
+        &["release", "plan", "--ref", "refs/tags/v2.0.0", "--dry-run"],
+        &[],
+    );
+    assert!(
+        ok && out.contains("publish=false") && out.contains("build=true"),
+        "{out}"
+    );
+    e.write(".github/release-readiness.toml", "ready = false\n");
+    let (ok, out) = e.call(&args, &[]);
+    assert!(ok && out.contains("publish=false"), "{out}");
+    e.write(".github/release-readiness.toml", "ready = true\n");
+    e.write("Cargo.toml", "[workspace.package]\nversion = '2.0.1'\n");
+    let (ok, out) = e.call(&args, &[]);
+    assert!(!ok && out.contains("manifest version"), "{out}");
+    e.write("Cargo.toml", "[workspace.package]\nversion = '2.0.0'\n");
+    e.write("crates/demo.rs", "pub fn unmerged() {}\n");
+    e.commit("fix: unmerged candidate");
+    let (ok, out) = e.call(&args, &[]);
+    assert!(!ok && out.contains("tag does not name HEAD"), "{out}");
+    e.git(&["tag", "v2.0.1"]);
+    let (ok, out) = e.call(&["release", "plan", "--ref", "refs/tags/v2.0.1"], &[]);
+    assert!(!ok && out.contains("main"), "unmerged tag: {out}");
+}
+
+#[test]
+fn installed_binary_has_path_guidance() {
+    let e = Env::new();
+    install_fixture(&e);
+    let (ok, out) = installer(&e, &[]);
+    assert!(ok && out.contains("PATH"), "{out}");
+}
+
+#[test]
+fn release_smoke_requires_offline_bootstrap_from_the_installed_binary() {
+    let e = Env::new();
+    let (ok, out) = e.call(
+        &[
+            "release",
+            "smoke",
+            "--binary",
+            env!("CARGO_BIN_EXE_fleet-install-fixture"),
+            "--version",
+            "v1.2.3",
+            "--first-run-dir",
+            "clean-user",
+        ],
+        &[],
+    );
+    assert!(!ok && out.contains("bootstrap missing"), "{out}");
+}
+
+#[test]
+fn release_checksums_include_published_installers_and_starter_metadata() {
+    let e = Env::new();
+    install_fixture(&e);
+    for name in [
+        "install-release.sh",
+        "install-release.ps1",
+        "vega-provenance.json",
+        "vega-starter.toml",
+    ] {
+        e.write(&format!("releases/v1.2.3/{name}"), "release metadata");
+    }
+    let (ok, out) = e.call(
+        &[
+            "release",
+            "checksums",
+            "--version",
+            "v1.2.3",
+            "releases/v1.2.3",
+        ],
+        &[],
+    );
+    assert!(ok, "{out}");
+    let sums = fs::read_to_string(e.0.join("releases/v1.2.3/fleet-v1.2.3-checksums.txt")).unwrap();
+    for name in [
+        "install-release.sh",
+        "install-release.ps1",
+        "vega-provenance.json",
+        "vega-starter.toml",
+    ] {
+        assert!(sums.contains(&format!("  {name}\n")), "{sums}");
+    }
+}
+
+#[test]
+fn native_release_fixture_installs_with_binary_mode_checksum_tools() {
+    let e = Env::new();
+    install_fixture(&e);
+    let fixture = e.0.join("installer-fixture/v1.2.3");
+    fs::create_dir_all(&fixture).unwrap();
+    for item in fs::read_dir(e.0.join("releases/v1.2.3")).unwrap() {
+        let item = item.unwrap();
+        if item
+            .file_name()
+            .to_string_lossy()
+            .ends_with("checksums.txt")
+        {
+            continue;
+        }
+        fs::copy(item.path(), fixture.join(item.file_name())).unwrap();
+    }
+    let recipe = include_str!("../../../.github/workflows/cd.yml")
+        .lines()
+        .find(|l| l.contains("sha256sum") && l.contains("checksums.txt"))
+        .expect("native release fixture checksum recipe")
+        .trim();
+    // On Windows PATH may resolve bash.exe to WSL, not Git Bash. Locate the
+    // shell shipped beside the declared Git prerequisite, as Actions does.
+    #[cfg(windows)]
+    let shell = {
+        let output = run(&Spec::new("git", Duration::from_secs(10)).arg("--exec-path"))
+            .success_text()
+            .expect("Git prerequisite");
+        Path::new(output.trim())
+            .ancestors()
+            .map(|p| p.join("bin/bash.exe"))
+            .find(|p| p.is_file())
+            .expect("Git for Windows Bash is required for native release fixture acceptance")
+    };
+    #[cfg(not(windows))]
+    let shell = PathBuf::from("bash");
+    let mut spec =
+        Spec::new(shell, Duration::from_secs(30)).args(["-eo", "pipefail", "-c", recipe]);
+    spec.cwd = Some(e.0.clone());
+    spec.env.push(("VERSION".into(), "v1.2.3".into()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Model Windows' binary default without claiming native Windows evidence.
+        let tool =
+            run(&Spec::new("sh", Duration::from_secs(10)).args(["-c", "command -v sha256sum"]))
+                .success_text()
+                .expect("sha256sum prerequisite");
+        e.write(
+            "checksum-tools/sha256sum",
+            &format!("#!/bin/sh\nexec '{}' --binary \"$@\"\n", tool.trim()),
+        );
+        fs::set_permissions(
+            e.0.join("checksum-tools/sha256sum"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let mut paths = vec![e.0.join("checksum-tools")];
+        paths.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+        spec.env.push((
+            "PATH".into(),
+            std::env::join_paths(paths)
+                .unwrap()
+                .to_string_lossy()
+                .into(),
+        ));
+    }
+    let result = run(&spec);
+    assert!(result.success_text().is_some(), "{result:?}");
+    fs::copy(
+        fixture.join("fleet-v1.2.3-checksums.txt"),
+        e.0.join("releases/v1.2.3/fleet-v1.2.3-checksums.txt"),
+    )
+    .unwrap();
+    let (ok, out) = installer(&e, &[]);
+    assert!(ok, "native release checksum fixture: {out}");
 }
