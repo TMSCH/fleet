@@ -30,7 +30,7 @@ session when the Task is deleted. The guarantees behind each step are in
 ## Spec
 
 Written by people and scripts through `fleet apply`. Fixed once created,
-except `dispatch`.
+except `dispatch` and `forge`.
 
 | Field | Required | Meaning |
 | --- | --- | --- |
@@ -43,6 +43,7 @@ except `dispatch`.
 | `workspace.dir` | yes | The session's working directory. The thurbox runtime needs an absolute path on the host. |
 | `dispatch` | no | Nothing spawns while `false` (the default). |
 | `outputs` | no | The structured outputs a result must carry, by name: each `{"type": T, "required": bool}`, where T is `string`, `integer`, `number`, `boolean`, `object` or `array`. |
+| `forge` | no | Overrides of the `[forge]` defaults for the changes this Task's worker declares: `relay.notes`, `relay.checks`, `draft.policy` (a name under `[forge.readyPolicies]`; `null` disables mark-ready; acted on by the mark-ready step). Field-level: absent fields inherit. Mutable like `dispatch`. |
 
 `harness` and `host` may not start with `-`. Any other field is refused.
 
@@ -51,10 +52,11 @@ precedence, validation and private launch snapshots.
 
 ## Status
 
-Written by TaskController under the manager lease, except `result`, which
-the worker writes through `fleet result`, and `inbox`, which nobody owns and
-which changes only through the two typed mutations described under
-[Inbox](#inbox).
+Written by TaskController under the manager lease, except `result` and
+`declared`, which the worker writes through `fleet result` and `fleet
+declare`, `forge`, which the [Forge controller](../forge-controller/README.md)
+writes, and `inbox`, which nobody owns and which changes only through the
+typed mutations described under [Inbox](#inbox).
 
 | Field | Meaning |
 | --- | --- |
@@ -70,8 +72,10 @@ which changes only through the two typed mutations described under
 | `brief` | The brief's key and the generation it was sent for, once it has a receipt. |
 | `result` | The worker's claim: outcome, generation, summary, artifacts, outputs. |
 | `inbox` | Messages queued for the session, oldest first: `{key, from, text, about, queuedAt}`. Appended by `fleet send`, removed by TaskController once delivered, each through a typed store mutation; never replaced as a list. |
-| `deliveries` | TaskController's: `receipts`, the newest 100 delivery receipts by inbox key (`{key, from, at, recovered}`), and `revisions`, per source the highest `about.revision` delivered, which keeps a duplicate out after its receipt has rotated. |
+| `deliveries` | TaskController's: `receipts`, the newest 100 delivery receipts by inbox key (`{key, from, at, recovered}`), and `revisions`, per mirror (`about.uid`) the highest `about.revision` delivered, which keeps a duplicate out after its receipt has rotated. |
 | `deliveryAttempts` | TaskController's bookkeeping per inbox entry being delivered: `sends` (bounded at 3), `probeFailures` and `failed`. Removed with the entry. |
+| `declared` | The worker's, through `fleet declare`: facts it declared, each a JSON object with a required string `kind` and nothing else validated. See [Following declared changes](#following-declared-changes). |
+| `forge` | The Forge controller's: one entry per declared change, keyed by ChangeRequest name, with its `uid`, `state`, `cursor`, `gaps`, mark-ready record and `notBefore`, plus that controller's conditions. Absent for a Task that declared nothing. |
 
 ## Metadata and ownership
 
@@ -83,8 +87,9 @@ Deleting a Task sets `deletionTimestamp` while the finalizer holds its record.
 Nonempty `ownerReferences` are refused.
 
 `fleet apply` accepts desired spec and labels, and refuses supplied status.
-Only `dispatch` can change in an existing spec. Setting it false prevents a
-Pending Task from spawning; it does not stop a session already spawned.
+Only `dispatch` and `forge` can change in an existing spec. Setting
+`dispatch` false prevents a Pending Task from spawning; it does not stop a
+session already spawned.
 
 ## Worker result
 
@@ -113,18 +118,19 @@ prints the entry as appended.
 | Field | Meaning |
 | --- | --- |
 | `key` | Deterministic and unique across `inbox` and `deliveries`; also the runtime intent key the delivery is journaled under. |
-| `from` | `cli/<user>` for `fleet send`; `forge/<change>` for a relay, by design. |
+| `from` | `cli/<user>` for `fleet send`; `forge/<change>` for a relay, the ChangeRequest's name. |
 | `text` | The message, delivered as typed. |
 | `about` | For a relay: the mirror's `uid`, `revision` and `head`. Absent for `fleet send`. |
 | `queuedAt` | Unix milliseconds. |
 
-`status.inbox` has no owner. The store reaches it through two typed
-mutations, each named by its caller: append, which refuses a key already in
-`inbox` or `deliveries`, an `about.revision` not above the source's highest
-delivered one, an append while more than 20 entries are undelivered, and a
-deleting Task; and record-and-remove, TaskController's status write that
-also moves one entry's receipt into `deliveries` and the entry out of
-`inbox`. No manager may replace the list.
+`status.inbox` has no owner. The store reaches it through typed mutations,
+each named by its caller: append (`fleet send`, and the Forge controller's
+relay write, which also replaces `status.forge`), which refuses a key
+already in `inbox` or `deliveries`, an `about.revision` not above the
+mirror's highest delivered one, an append while more than 20 entries are
+undelivered, and a deleting Task; and record-and-remove, TaskController's
+status write that also moves one entry's receipt into `deliveries` and the
+entry out of `inbox`. No manager may replace the list.
 
 TaskController delivers inbox entries as it delivers the brief, oldest
 first, one per pass: only to a session observed ready on that pass, under
@@ -141,20 +147,20 @@ describes; a readable lookup that no longer shows its session is
 Task delivers nothing: a deleting Task refuses `fleet send` and releases its
 session as before.
 
-## Planned additions
+## Following declared changes
 
-Design, not implemented. The [Forge controller](../forge-controller/README.md)
-design adds the pieces below to the Task. None is served by the installed
-binary.
+The [Forge controller](../forge-controller/README.md), a second controller
+over the Task, reads the changes a worker declared and relays what is new on
+each into the inbox.
 
 | Field or verb | Owner | Meaning |
 | --- | --- | --- |
-| `spec.forge` | `apply`; mutable like `dispatch` | Optional overrides of the `[forge]` defaults: `relay.notes`, `relay.checks`, `draft.policy` (a name under `[forge.readyPolicies]`, refused if undefined; `null` disables mark-ready). Field-level: absent fields inherit. |
+| `spec.forge` | `apply`; mutable like `dispatch` | Optional overrides of the `[forge]` defaults: `relay.notes`, `relay.checks`, `draft.policy` (a name under `[forge.readyPolicies]`; `null` disables mark-ready; stored now, acted on by the mark-ready step). Field-level: absent fields inherit. |
 | `status.declared` | `worker`, through `fleet declare` | Facts the worker declared, each a JSON object with a required string `kind` and nothing else validated. `--change-request URL` writes `{kind: "ChangeRequest", url, name}` and ensures the named ChangeRequest exists; `--json` writes any object. Accepted after the brief has a receipt and before deletion; a repeated URL is a no-op; it concludes nothing. |
-| `status.forge` | ForgeController | One entry per declared change, keyed by ChangeRequest name: its `uid`, `cursor`, `gaps`, mark-ready record and `notBefore`; plus this controller's conditions. Empty for a Task that declared nothing. |
+| `status.forge` | ForgeController | One entry per declared change, keyed by ChangeRequest name: its `uid`, `state`, `cursor`, `gaps`, mark-ready record and `notBefore`; plus this controller's conditions. Absent for a Task that declared nothing. |
 
-The Forge controller also appends to `status.inbox`, as `forge/<change>`,
-through the same typed append `fleet send` uses, with `about` set. The
+The Forge controller appends to `status.inbox` as `forge/<change>`, with
+`about` set, in the same write that advances the entry's cursor. The
 [Forge controller interface](../forge-controller/interface.md#fields-this-controller-reads-and-owns)
 defines every field of `status.declared` and `status.forge`, with an example
 of a Task following two changes.
@@ -179,6 +185,8 @@ lists the resulting writers.
 fleet apply -f task.json             # create, or change dispatch
 fleet status task design-305 --json  # phase and conditions
 fleet send design-305 "Also update the docs."  # queue a message for the session
+fleet declare design-305 --change-request https://github.com/OWNER/app/pull/88  # follow the change the worker opened
+fleet declare design-305 --json '{"kind": "Note", "text": "docs need a pass"}'   # any fact with a kind
 fleet result design-305 --generation 1 --outcome shipped \
   --output prUrl='"https://example.test/pr/1"'
 fleet delete task design-305         # release the session, then remove

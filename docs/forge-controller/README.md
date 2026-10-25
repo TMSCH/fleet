@@ -1,20 +1,21 @@
 # Forge controller
 
-Design, not implemented. These pages describe a planned controller; nothing
-here is served by the installed binary.
-
 ForgeController is a second controller over the [Task](../resources/task.md).
 It is not a kind of its own and creates nothing. It reads the
 [ChangeRequests](../resources/change-request.md) a Task's worker declared,
 keeps the worker informed about each by relaying what is new into the Task's
-inbox, and takes a draft change out of draft when a policy says it is ready.
-It owns one status subtree, `status.forge`, the way the worker owns
-`status.result`; TaskController's fields are untouched, and so is every
-ChangeRequest.
+inbox, and, in a step still to come, takes a draft change out of draft when
+a policy says it is ready. It owns one status subtree, `status.forge`, the
+way the worker owns `status.result`; TaskController's fields are untouched,
+and so is every ChangeRequest.
+
+Following and the relay are served by the installed binary. The mark-ready
+effect and its ready policies are designed and not implemented: the
+sections that describe them say so.
 
 | Read | Answers |
 | --- | --- |
-| [Task](../resources/task.md#planned-additions) | What does a worker declare, and what do `spec.forge` and `status.forge` hold? |
+| [Task](../resources/task.md#following-declared-changes) | What does a worker declare, and what do `spec.forge` and `status.forge` hold? |
 | [ChangeRequest](../resources/change-request.md) | What does the snapshot this controller reads contain, and who deletes it? |
 | [State machine](state-machine.md) | How does each declared change move from Following to Settled, and what is relayed when? |
 | [Interface](interface.md) | What are the probes, the one effect, the ready policies and the write rules? |
@@ -49,7 +50,8 @@ ChangeRequest.
    labelled as a worker's.
 6. When the ready policy holds on a draft change that has never been seen
    ready, the session is idle and the mirror is fresh, ForgeController plans
-   `MarkReady` once. The next ChangeRequest revision proves it.
+   `MarkReady` once. The next ChangeRequest revision proves it. (Design: the
+   mark-ready step is not implemented yet.)
 7. The worker reports with `fleet result`. Notes that arrive afterwards are
    still relayed: a Concluded Task with a nonempty inbox is due again.
 8. The ChangeRequest settles when the change merges or stays closed past its
@@ -90,15 +92,17 @@ the ChangeRequest for a person or a conductor; Fleet never merges.
 
 ## Implementation and evidence
 
-Planned, in four steps, each its own change with its own E2E suite against the
-built CLI and stub forge executables:
+Four steps, each its own change with its own E2E suite against the built CLI
+and the fake or stub forges:
 
-1. `fleet-forge` and the [ChangeRequest controller](../change-request-controller/README.md),
-   with retention.
-2. The Task inbox, `fleet send`, and inbox delivery in TaskController.
-3. `fleet declare` and ForgeController with the join message and the relay.
-4. The mark-ready effect and the shipped ready policies.
+| Step | What | Where | Evidence |
+| --- | --- | --- | --- |
+| 1 | `fleet-forge` and the [ChangeRequest controller](../change-request-controller/README.md), with retention | `crates/fleet-forge`, `fleet-controllers/src/change_request.rs` | `change_request_controller`, `e2e_forge` |
+| 2 | The Task inbox, `fleet send`, and inbox delivery in TaskController | `fleet-api/src/inbox.rs`, `fleet-store` typed mutations, `fleet-controllers/src/task.rs` | `store_contract`, `task_controller`, `e2e_inbox` |
+| 3 | `fleet declare`, `spec.forge`, `status.declared`, `status.forge`, and ForgeController with the join message and the relay | `fleet-api/src/follow.rs`, `fleet-controllers/src/forge.rs`, `fleet-manager` (`declare`, the second controller's sweep), `fleet-store` (`record_relay`) | `forge_controller`, `e2e_forge_controller`, `store_contract`, `architecture` |
+| 4 | The mark-ready effect and the shipped ready policies | Design, not implemented | |
 
-Each step keeps `cargo xtask check` green, adds its crate edges and status
-writers to `crates/architecture.toml` with negative fixtures, and shrinks the
-list of kinds `e2e_task_lifecycle` expects to be refused.
+Each step keeps `cargo xtask check` green and adds its crate edges and status
+writers to `crates/architecture.toml` with negative fixtures. The mark-ready
+record on each entry and `spec.forge.draft.policy` are stored by step 3 and
+acted on by step 4.

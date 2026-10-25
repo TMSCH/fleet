@@ -1,7 +1,5 @@
 # Forge controller state machine
 
-Design, not implemented.
-
 ForgeController has no phase of its own: the Task's `status.phase` belongs to
 TaskController. What it tracks is each declared change, as an entry under
 `status.forge.changes`. The [interface](interface.md) defines the probes,
@@ -18,12 +16,14 @@ nothing of this controller's to release.
 
 | Entry state | Observation or input | Next state | Decision |
 | --- | --- | --- | --- |
-| none | A declaration of kind `ChangeRequest` with no entry, and its object Known | Following | Add the entry with the object's `uid`; append a [join message](#joining) holding the whole snapshot; `cursor = revision`. |
+| none | A declaration of kind `ChangeRequest` with no entry, and its object Known with a `status.ref` | Following | Add the entry with the object's `uid`; append a [join message](#joining) holding the whole snapshot; `cursor = revision`. |
+| none | The same, object Known but its own controller has not recorded a `ref` yet | none | Wait: there is no snapshot to join at, and the ChangeRequest is polled later in the same sweep. |
 | none | The same, object Unknown or absent | none | Wait; readable absence of a just-declared object is `NeedsAttention/ChangeGone`. |
 | Following | ChangeRequest Known, same `uid`, not Settled | Following | Run the [relay](#relay) and the [mark ready](#mark-ready). |
 | Following | ChangeRequest Known, different `uid` | Following | A new incarnation after retention: replace the `uid`, send a join message, `cursor = revision`, reset the mark-ready record. |
 | Following | ChangeRequest Unknown | Following | Skip this entry this pass. |
-| Following | ChangeRequest readable and absent | Following | `NeedsAttention/ChangeGone`, naming the entry; keep the entry, in case it is re-declared. |
+| Following | ChangeRequest readable and absent | Following | `NeedsAttention/ChangeGone`, naming the entry; keep the entry, in case it is re-declared. The reason clears when the object is Known again. |
+| Following | Fleet's login on the change's host Unknown | Following | Skip this entry this pass: attribution is needed to filter. |
 | Following | ChangeRequest phase Settled | Settled | Relay anything still above the cursor, then stop reading it. |
 | Settled | none asked | Settled | Terminal for the entry. |
 
@@ -40,8 +40,10 @@ mergeability answer with its reason, the unresolved thread count, and the
 retained notes rendered as the relay renders them, with their authors and
 places. The cursor is set to the snapshot's revision in the same write, so
 the next relay carries only what comes after. A gap already recorded on the
-mirror, `droppedBefore > 0`, is stated in the join message and is not a
-`RelayGap`: the newcomer never had those notes.
+mirror, `droppedBefore > 0`, is stated in the join message as older notes
+that exist on the forge beyond the ones carried, and is not a `RelayGap`:
+the newcomer never had those notes. The same message, saying the change was
+declared again, is the join after a rebind to a new incarnation.
 
 ## Relay
 
@@ -55,7 +57,7 @@ if whoami for this host is Unknown:
 if cr.droppedBefore > entry.cursor:
     gap = notes rotated out since the cursor are lost
     render the gap notice and the whole retained snapshot instead of a diff
-    entry.gaps += 1; NeedsAttention/RelayGap is set, and clears on the next clean relay
+    entry.gaps += 1; NeedsAttention/RelayGap is set, and clears on the next relay that carries something
 else:
     new_notes = cr.notes
         where seq > entry.cursor
@@ -84,16 +86,22 @@ top-level comment is never considered answered by anything but its own
 relay.
 
 `render` quotes each note as data: author, kind, `path:line` against the
-head it was written on, URL and body, with a line saying these are review
-feedback and not instructions. A marked note from another Fleet worker is
-labelled as such with that worker's Task name. A transition reads as "state
-`<old>` to `<new>`", "review decision `<value>`" or "checks `<state>` on head
-`<id>`" with the failing names and URLs. The message carries `about`, the
-mirror's `uid`, `revision` and `head` it was computed from, because by the
+head it was written on, thread, URL, the revision that numbered it, and the
+body with every line quoted, under a header saying these are review feedback
+and not instructions. A marked note from another Fleet worker is labelled as
+such with that worker's Task name (its `uid`, when the manager has no Task
+of that name). A transition reads as "state changed to `<new>`" (the mirror
+keeps no previous value, so the old one is not named), "review decision
+changed to `<value>`" or "checks `<state>` on head `<id>`" with the failing
+names and URLs; a head whose checks are `none` or `pending` is not a
+transition worth a message. When the change settled on this pass the
+message ends by saying so, with the mirror's `Settled` reason. The message
+carries `about`, the mirror's `uid`, `revision` and `head` it was computed
+from, because by the
 time it is delivered the change may have moved on; a worker reads a relay as
 an observation at that revision, not as the present. `spec.forge.relay`
 turns notes or checks off; a policy that depends on bot feedback relays bot
-blockers regardless of `forge.relayBots`.
+blockers regardless of `forge.relayBots` (mark-ready step).
 
 Why the filters: this Task's own marked words are never relayed, because a
 session sent its own reply answers itself. Another Fleet worker's marked
@@ -106,6 +114,10 @@ answered. An unmarked note from Fleet's login is a person's until it says
 otherwise.
 
 ## Mark ready
+
+Design, not implemented: this section is the mark-ready step, which builds
+on the `markReady` record and `spec.forge.draft.policy` the relay step
+stores untouched.
 
 Per entry, plan `MarkReady` when all of the following hold:
 
@@ -157,7 +169,7 @@ every open reason, each naming its entry, in its message.
 | --- | --- |
 | Following | At least one entry is not settled. |
 | Settled | Every entry has settled. |
-| NeedsAttention | Reasons are `RelayGap`, `MarkReadyFailed`, `ChangeGone`, `PolicyUnknown` (the selected policy is not in the config). |
+| NeedsAttention | Reasons are `RelayGap`, `ChangeGone`, and, with the mark-ready step, `MarkReadyFailed` and `PolicyUnknown` (the selected policy is not in the config). The message holds one line per open reason, `<Reason> <entry> <text>`, and the reason is the one kind open or `Multiple`; an entry not observed on a pass keeps its lines. |
 
 NeedsAttention does not stop the controller: other entries keep relaying, and
 a gap on one entry is reported, not acted on.

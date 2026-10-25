@@ -648,6 +648,18 @@ impl Store for Racing<'_> {
         self.inner
             .record_delivery(name, status, receipt, expected, by, lease)
     }
+    fn record_relay(
+        &self,
+        name: &str,
+        forge: Value,
+        appends: Vec<fleet_api::inbox::InboxEntry>,
+        expected: u64,
+        by: FieldManager,
+        lease: &LeaseToken,
+    ) -> Result<Object, StoreError> {
+        self.inner
+            .record_relay(name, forge, appends, expected, by, lease)
+    }
     fn delete(
         &self,
         kind: &str,
@@ -722,6 +734,7 @@ fn a_stale_delete_plan_cannot_remove_a_recreated_object() {
         holder: "stale-delete-test".into(),
         forge: Some(forge_port.as_ref()),
         change_request_defaults: ChangeRequestDefaults::default(),
+        forge_defaults: Default::default(),
     };
     let report = manager
         .run(RunOptions {

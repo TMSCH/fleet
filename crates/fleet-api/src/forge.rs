@@ -288,7 +288,7 @@ pub trait Forge {
     /// Take a draft out of draft under `intent_key`, after a fresh read that
     /// proves the change still has `expect`'s head and state. `Done {
     /// already }`, or Failed when it moved. Nothing in this build calls it:
-    /// the Forge controller, a later step, does.
+    /// the Forge controller's mark-ready step, still to come, does.
     fn mark_ready(
         &self,
         change: &ChangeRef,

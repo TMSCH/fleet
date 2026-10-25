@@ -21,6 +21,9 @@ pub enum FieldManager {
     TaskController,
     /// The one controller for ChangeRequest; owns all of its status.
     ChangeRequestController,
+    /// The second controller over Task; owns `Task.status.forge` and
+    /// appends to `Task.status.inbox`.
+    ForgeController,
     /// A person at the command line, through `fleet send`: appends to
     /// `Task.status.inbox` and owns nothing.
     Cli,
@@ -33,6 +36,7 @@ impl FieldManager {
             FieldManager::Worker => "worker",
             FieldManager::TaskController => "task-controller",
             FieldManager::ChangeRequestController => "change-request-controller",
+            FieldManager::ForgeController => "forge-controller",
             FieldManager::Cli => "cli",
         }
     }
@@ -41,7 +45,9 @@ impl FieldManager {
     pub fn is_controller(self) -> bool {
         matches!(
             self,
-            FieldManager::TaskController | FieldManager::ChangeRequestController
+            FieldManager::TaskController
+                | FieldManager::ChangeRequestController
+                | FieldManager::ForgeController
         )
     }
 }
@@ -177,6 +183,20 @@ pub trait Store {
         name: &str,
         status: Value,
         receipt: crate::inbox::DeliveryReceipt,
+        expected: u64,
+        by: FieldManager,
+        lease: &LeaseToken,
+    ) -> Result<Object, StoreError>;
+    /// ForgeController's status write: replace `Task.status.forge` with
+    /// `forge` and append `appends` to `status.inbox`, each checked as
+    /// `append_inbox` checks one, in the same compare-and-swap write under
+    /// the lease. The cursors in `forge` and the entries land together or
+    /// not at all; no other field changes.
+    fn record_relay(
+        &self,
+        name: &str,
+        forge: Value,
+        appends: Vec<crate::inbox::InboxEntry>,
         expected: u64,
         by: FieldManager,
         lease: &LeaseToken,

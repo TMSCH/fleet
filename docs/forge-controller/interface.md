@@ -1,29 +1,37 @@
 # Forge controller interface
 
-Design, not implemented.
-
 The controller is a pure decision function over a Task and the ChangeRequests
 it follows. The manager owns I/O, persistence and process execution. The
 [state machine](state-machine.md) defines how the values below change
-`status.forge`; the [Task resource](../resources/task.md#planned-additions)
-lists the fields among the Task's planned additions.
+`status.forge`; the [Task resource](../resources/task.md#following-declared-changes)
+lists the fields on the Task. The mark-ready parts of this page, the
+`MarkReady` action, the `AtRest` probe and the [ready policies](#ready-policies),
+are design, not implemented.
 
 ## Controller API
+
+Source: [ForgeController](../../crates/fleet-controllers/src/forge.rs) and
+[the Task's forge fields](../../crates/fleet-api/src/follow.rs).
 
 ```rust
 pub struct ForgeInput<'a> {
     pub task: &'a Object,
     pub observations: ForgeObservations,
     pub now: Millis,
+    pub defaults: ForgeDefaults,
 }
 
+pub fn due(task: &Object, now: Millis) -> bool;
 pub fn probes(&self, input: &ForgeInput<'_>) -> Result<Vec<Probe>, StoreError>;
 pub fn reconcile(&self, input: &ForgeInput<'_>) -> Result<Plan, StoreError>;
 ```
 
 `task` is the stored Task, including the worker's `status.declared` and this
 controller's `status.forge`. Missing `status.forge` decodes to no entries.
-Neither method reads the clock, disk, environment, forge or runtime itself.
+`defaults` carries `forge.relayNotes`, `forge.relayChecks` and
+`forge.relayBots` from the native config, as values. `due` is the
+controller's own gate, which the manager asks before anything else. Neither
+method reads the clock, disk, environment, forge or runtime itself.
 
 ## Fields this controller reads and owns
 
@@ -76,7 +84,8 @@ A Task that opened a change in each of two repositories:
         {"uid": "…", "state": "following", "cursor": 2, "gaps": 0,
          "markReady": {"state": "none", "head": null, "attempts": 0}}
     },
-    "conditions": [{"type": "Following", "status": "True", "reason": "TwoOpen"}]
+    "conditions": [{"type": "Following", "status": "True", "reason": "Following",
+                    "message": "2 of 2 followed change(s) still open"}]
   }
 }
 ```
@@ -91,9 +100,9 @@ to and TaskController removes from:
 | Field | Meaning |
 | --- | --- |
 | `key` | Deterministic: `task/<name>/<uid>/relay/<change uid>/<revision>` for a relay or a join, `task/<name>/<uid>/send/<n>` for `fleet send`. Refused if already present in `inbox` or `deliveries`. |
-| `from` | `forge/<change>` or `cli/<user>`. |
+| `from` | `forge/<change>`, the ChangeRequest's name, or `cli/<user>`. |
 | `text` | The message, delivered as typed. |
-| `about` | For a relay: the mirror's `uid`, `revision` and `head.id` the message was computed from. Absent for `fleet send`. |
+| `about` | For a relay: the mirror's `uid`, `revision` and `head.id` the message was computed from. Absent for `fleet send`. TaskController's `deliveries.revisions` keeps the highest delivered revision per mirror `uid`, so a recreated mirror starts afresh. |
 | `queuedAt` | Unix milliseconds. |
 
 ### Requested probes
@@ -102,7 +111,7 @@ to and TaskController removes from:
 | --- | --- |
 | No declaration and no entries | None. |
 | A declaration without an entry, or an entry not Settled | `Object { kind: ChangeRequest, name }` per such change; `Whoami { host }` once per distinct host. |
-| An entry whose mark-ready is being evaluated | `AtRest { session }` for the Task's recorded session, for the `workerIdle` predicate. |
+| An entry whose mark-ready is being evaluated | `AtRest { session }` for the Task's recorded session, for the `workerIdle` predicate. (Mark-ready step.) |
 | Every entry Settled | None. |
 | Deleting | None. |
 
@@ -111,18 +120,22 @@ to and TaskController removes from:
 is unreadable. It needs no lease renewal and runs before any runtime or forge
 probe. `Probe::Whoami` is answered by `Forge::whoami` and cached by the
 manager for the sweep. `AtRest` is the Task controller's existing probe,
-reused.
+reused. `probes` returns only what the observations lack, so the manager asks
+in rounds: the objects first, then the login on each host those objects'
+`status.ref` names, until nothing is asked.
 
-`ForgeObservations` holds `changes` (keyed by entry), `whoami` (keyed by
-host) and `at_rest`. Each is optional; `None` means not asked.
+`ForgeObservations` holds `changes` (keyed by ChangeRequest name), `whoami`
+(keyed by host), `at_rest`, and `workers`, every Task's name by `uid`, which
+labels another worker's marked note. An absent key means not asked.
 
 ### Returned plan
 
 The same `Plan` type the Task controller returns, restricted to this
-controller's fields: `status` carries the desired `status.forge`, including
-every advanced cursor and every new mark-ready intent, and a list of inbox entries
-to append, and nothing else; the store refuses a plan that names another
-manager's field. `effects` holds `MarkReady` actions only.
+controller's fields: `status` carries the desired `status.forge` alone,
+including every advanced cursor and every new mark-ready intent, and
+`appends` the inbox entries to land with it, and nothing else; the store
+refuses a plan that names another manager's field. `effects` holds
+`MarkReady` actions only (mark-ready step; empty today).
 `remove_finalizer` is always `None`.
 
 | Action | Performed by the manager through | Receipt |
@@ -149,6 +162,9 @@ answers by observing the change's state, never by repeating the effect.
 Mark-ready intents and receipts live on the entry, apart from TaskController's.
 
 ## Ready policies
+
+Design, not implemented: this section is the mark-ready step. `spec.forge.draft.policy`
+is stored today and acted on then.
 
 A policy is a set of predicates, declared in native config under
 `[forge.readyPolicies.<name>]` and selected by `spec.forge.draft.policy` or
@@ -200,7 +216,8 @@ a generation it has not seen.
 ## The declare verb
 
 `fleet declare TASK --change-request URL` is a manager verb, like
-`fleet result`:
+`fleet result` (`declare_change_request` in
+[the verbs](../../crates/fleet-manager/src/verbs.rs)):
 
 1. Parse the URL through the Forge port; a host not configured is refused.
 2. Ensure one ChangeRequest exists for it, named from the canonical ref, by
@@ -212,8 +229,10 @@ a generation it has not seen.
 
 `fleet declare TASK --json '{"kind": "…", …}'` appends any object with a
 string `kind`; Fleet validates nothing else and this controller ignores
-kinds it does not know. Both forms are accepted after the brief has a receipt
-and before deletion, and conclude nothing. The two steps of the first form
+kinds it does not know; the same object again is a no-op. Both forms are
+accepted after the brief has a receipt and before deletion, and conclude
+nothing; the Task is checked before any ChangeRequest is created, so an
+ineligible Task leaves no orphan. The two steps of the first form
 are not atomic; a crash between them leaves a ChangeRequest nobody follows,
 which is polled until it settles and then removed by retention, and the next
 `declare` of that URL finds it.
@@ -229,13 +248,17 @@ applies, with these additions:
    manager rereads the Task before running ForgeController, so the second
    plan does not conflict with the first on every sweep.
 2. `Object` probes are answered from the store before the lease is renewed
-   for runtime or forge probes.
+   for runtime or forge probes; `Whoami` is asked through the Forge port
+   once per host per sweep and the answer shared by every Task on it.
 3. The plan's status write uses the store's typed mutation for this
-   controller: replace `status.forge` and append the listed inbox entries,
-   in one CAS write. TaskController's counterpart records a delivery and
-   removes the delivered entry in one write. `fleet send` appends one entry.
+   controller, `record_relay`: replace `status.forge` and append the listed
+   inbox entries, in one CAS write; a duplicate key refuses the whole write
+   and the next pass decides again. TaskController's counterpart records a
+   delivery and removes the delivered entry in one write. `fleet send`
+   appends one entry.
 4. `MarkReady` is performed through the Forge port after the lease is
-   renewed, like a runtime effect, then its receipt is written.
+   renewed, like a runtime effect, then its receipt is written. (Mark-ready
+   step.)
 
 ## Store port and write ownership
 
@@ -243,13 +266,14 @@ applies, with these additions:
 | --- | --- | --- |
 | `apply` | New Task, labels, `dispatch`, `spec.forge`; request deletion | Store validation, exclusive creation or resourceVersion CAS. |
 | `worker` | `status.result`; `status.declared` through `fleet declare` | Current resourceVersion and a delivered brief. |
-| `forge-controller` | All of `status.forge`; appends to `status.inbox` | Current resourceVersion and live manager lease. |
+| `forge-controller` | All of `status.forge`; appends to `status.inbox`, both through `record_relay` | Current resourceVersion and live manager lease. |
 | `cli` | Appends to `status.inbox` through `fleet send` | Current resourceVersion. No lease: the CLI calls a manager verb. |
 | `task-controller` | Everything else in Task status; `status.deliveries`; removes delivered `inbox` entries | Current resourceVersion and live manager lease. |
 
 `status.inbox` has no single owner. It is reached only through three typed
-mutations, append, append and remove, each named by its caller, with one
-rule the store enforces, no duplicate keys across `inbox` and `deliveries`.
+mutations, `append_inbox`, `record_relay` and `record_delivery`, each named
+by its caller and each naming its source with its own prefix, with one rule
+the store enforces, no duplicate keys across `inbox` and `deliveries`.
 This is an addition to the store's one-owner-per-field contract, stated in
 [the contracts](../../crates/CONTRACTS.md#what-is-served), not an exception
 to it: no mutation touches another manager's field. The architecture test

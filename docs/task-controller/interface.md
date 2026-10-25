@@ -168,20 +168,23 @@ Source: [Store](../../crates/fleet-api/src/store.rs) and
 | `apply` | New served resources, labels and permitted spec changes; request deletion | Store validation, exclusive creation or resourceVersion CAS for spec updates. |
 | `worker` | `status.result` through `record_result` | Current resourceVersion, delivered brief generation and declared output types. |
 | `cli` | Appends to `status.inbox` through `send` | Current resourceVersion. No lease: the CLI calls a manager verb. |
+| `forge-controller` | `status.forge`; appends to `status.inbox`, both through `record_relay` | Current resourceVersion and live manager lease. |
 | `task-controller` | Other Task status, `status.deliveries` and the release finalizer; removes delivered `inbox` entries | Current resourceVersion and live manager lease. |
 
-`status.inbox` has no owner. It is reached only through two typed
-mutations, `append_inbox` and `record_delivery`, each named by its caller
-(`kinds::may_append_inbox`, `kinds::may_record_delivery`), with the rules the
+The worker's `status.declared` is written through `declare`, with the same
+fencing as `record_result`. `status.inbox` has no owner. It is reached only
+through three typed mutations, `append_inbox`, `record_relay` and
+`record_delivery`, each named by its caller (`kinds::may_append_inbox`,
+`kinds::may_record_relay`, `kinds::may_record_delivery`), with the rules the
 store enforces: no duplicate key across `inbox` and `deliveries`, no
-`about.revision` at or below the source's highest delivered one, no append
+`about.revision` at or below the mirror's highest delivered one, no append
 while more than 20 entries are undelivered or the Task is deleting, and no
-other field of the Task changed by either. A plain `update_status` that
+other field of the Task changed by any of them. A plain `update_status` that
 changes `inbox` is refused whoever writes it.
 
 `Store` supplies `get`, `list`, `create`, `update_spec`, `update_status`,
-`append_inbox`, `record_delivery`, `delete`, `remove_finalizer`, validation
-and lease acquire/renew/release.
+`append_inbox`, `record_relay`, `record_delivery`, `delete`, `delete_fenced`,
+`remove_finalizer`, validation and lease acquire/renew/release.
 Private `launch`/`freeze_launch` methods recover or exclusively freeze launch
 data under Task UID, separately from resources. Freezing checks Task UID,
 resourceVersion and manager lease; final Task deletion removes the snapshot.
@@ -210,24 +213,24 @@ intent, effect receipt and attempt record are removed with it, so a Task's
 status stays bounded however many messages it is sent. The
 [state machine](state-machine.md#retries-and-recovery) defines each decision.
 
-## Planned additions
+## The second controller over the Task
 
-Design, not implemented. The [Forge](../forge-controller/interface.md) and
-[ChangeRequest](../change-request-controller/interface.md) controller designs
-extend this interface without changing what exists:
+The [Forge controller](../forge-controller/interface.md) extends this
+interface without changing what exists:
 
-- A second controller over the Task, ForgeController, with its own due gate,
-  run after this one on each sweep from a fresh read of the Task, owning
-  `status.forge` and appending to `status.inbox`. Its plan may name no other
-  Task field, performs one effect, `MarkReady`, and adds no finalizer.
-- `Probe::Object { kind, name }`, answered by the manager from the store
-  before any runtime probe, and `Probe::Whoami { host }`, answered through
-  the `Forge` port as `Probe::Change { ref }` already is for the
-  [ChangeRequest controller](../change-request-controller/interface.md).
-  `AtRest` is reused by ForgeController's `workerIdle` predicate. The plan's
-  `delete` field, by which that controller retires its own object, exists.
-- ForgeController appends to `status.inbox` through the existing
-  `append_inbox` mutation, naming itself, with `about` set on each relay;
-  its plan's status write replaces `status.forge` and appends the listed
-  entries in one CAS write. Field managers `ChangeRequestController` and
-  `ForgeController`, and `Worker` gains `status.declared`.
+- ForgeController has its own due gate (`ForgeController::due`: a
+  declaration without an entry, or a following entry whose `notBefore` is
+  absent or due) and runs after this controller on each sweep, from a fresh
+  read of the Task, owning `status.forge` and appending to `status.inbox`.
+  Its plan names no other Task field and adds no finalizer; its one effect,
+  `MarkReady`, is the mark-ready step's and is not implemented yet.
+- `Probe::Object { kind, name }` is answered by the manager from the store
+  before any runtime or forge probe, and `Probe::Whoami { host }` through
+  the `Forge` port, cached for the sweep, as `Probe::Change { ref }` is for
+  the [ChangeRequest controller](../change-request-controller/interface.md).
+  `AtRest` will be reused by ForgeController's `workerIdle` predicate. The
+  plan's `delete` field, by which that controller retires its own object,
+  and `appends`, the inbox entries ForgeController lands with its status,
+  exist.
+- Field managers `ChangeRequestController` and `ForgeController` exist, and
+  `Worker` owns `status.declared` as it owns `status.result`.

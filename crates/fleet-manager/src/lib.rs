@@ -7,6 +7,13 @@
 //! then its receipt. It also hosts the spec and worker verbs, so the CLI only
 //! parses and prints.
 //!
+//! Each Task has a second controller, ForgeController, with its own due
+//! gate: it runs after TaskController, from a fresh read of the Task, asks
+//! for the ChangeRequests the worker declared (answered from the store) and
+//! Fleet's login on their hosts (through the Forge port, cached for the
+//! sweep), and its plan is one typed write: `status.forge` replaced and the
+//! relay's inbox entries appended together. No effect, no receipt.
+//!
 //! The same sweep walks the ChangeRequests: each due one is observed through
 //! the Forge port and decided by ChangeRequestController, whose plan is one
 //! status write and, after retention, one fenced delete. There are no effects
@@ -18,21 +25,22 @@ pub mod verbs;
 use std::collections::BTreeMap;
 
 use fleet_api::change_request::{self, ChangeRequestDefaults, ChangeRequestSpec};
+use fleet_api::follow::ForgeDefaults;
 use fleet_api::forge::{ChangeObservation, Forge, Uncertainty};
 use fleet_api::plan::{Action, Effect, EffectOutcome, Observations, Plan, Probe, Receipt};
 use fleet_api::runtime::Runtime;
 use fleet_api::task;
 use fleet_api::{Clock, LeaseToken, Millis, Object, Observation, Store, StoreError};
 use fleet_controllers::{
-    ChangeRequestController, ChangeRequestInput, ChangeRequestObservations, TaskController,
-    TaskInput,
+    ChangeRequestController, ChangeRequestInput, ChangeRequestObservations, ForgeController,
+    ForgeInput, ForgeObservations, TaskController, TaskInput,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use verbs::{
-    ApplyOutcome, ResultOutcome, apply, apply_change_request, delete, derived_name, record_result,
-    send,
+    ApplyOutcome, DeclareOutcome, Declared, ResultOutcome, apply, apply_change_request, declare,
+    declare_change_request, delete, derived_name, record_result, send,
 };
 
 /// How a bounded reconcile run ends.
@@ -72,6 +80,8 @@ pub struct Manager<'a> {
     pub forge: Option<&'a dyn Forge>,
     /// The `[forge]` defaults a ChangeRequest spec may override.
     pub change_request_defaults: ChangeRequestDefaults,
+    /// The `[forge]` relay defaults a Task's `spec.forge` may override.
+    pub forge_defaults: ForgeDefaults,
 }
 
 impl std::fmt::Debug for Manager<'_> {
@@ -188,9 +198,50 @@ impl Manager<'_> {
                 }
             };
             let mut busy = false;
-            for obj in tasks.iter().filter(|t| self.due(t)) {
+            // Fleet's login per forge host, asked once per sweep.
+            let mut whoami: BTreeMap<String, Observation<String>> = BTreeMap::new();
+            let workers: BTreeMap<String, String> = tasks
+                .iter()
+                .map(|t| (t.metadata.uid.clone(), t.metadata.name.clone()))
+                .collect();
+            let now = self.clock.now();
+            for obj in &tasks {
+                let task_due = self.due(obj);
+                let forge_due = ForgeController::due(obj, now);
+                if !(task_due || forge_due) {
+                    continue;
+                }
                 *lease = self.store.renew_lease(lease, opts.lease_ttl)?;
-                let step = self.reconcile_task(obj, lease, opts.lease_ttl, report);
+                if task_due {
+                    let step = self.reconcile_task(obj, lease, opts.lease_ttl, report);
+                    busy |= self.tally(step, &obj.key(), report)?;
+                }
+                if !forge_due {
+                    continue;
+                }
+                // The second controller decides from the Task as it is now,
+                // after the first one's write, so the two plans do not
+                // conflict on every sweep.
+                let fresh = if task_due {
+                    match self.store.get(task::KIND, &obj.metadata.name) {
+                        Observation::Known(Some(o)) => o,
+                        Observation::Known(None) => continue,
+                        Observation::Unknown { why } => {
+                            report.unknowns.push(format!("{} reread: {why}", obj.key()));
+                            continue;
+                        }
+                    }
+                } else {
+                    obj.clone()
+                };
+                let step = self.reconcile_forge(
+                    &fresh,
+                    lease,
+                    opts.lease_ttl,
+                    report,
+                    &mut whoami,
+                    &workers,
+                );
                 busy |= self.tally(step, &obj.key(), report)?;
             }
             busy |= self.sweep_change_requests(lease, opts.lease_ttl, report)?;
@@ -331,6 +382,103 @@ impl Manager<'_> {
                 Err(StoreError::Conflict { .. }) => step.conflict = true,
                 Err(e) => return Err(e),
             }
+        }
+        Ok(step)
+    }
+
+    /// ForgeController on one Task: answer its `Object` probes from the store
+    /// (no lease renewal: no adapter is asked), then its `Whoami` probes
+    /// through the Forge port after a renewal, asking again until the
+    /// controller wants nothing more; decide; then write `status.forge` and
+    /// the relay's entries in one typed compare-and-swap write.
+    fn reconcile_forge(
+        &self,
+        obj: &Object,
+        lease: &mut LeaseToken,
+        ttl: Millis,
+        report: &mut RunReport,
+        whoami: &mut BTreeMap<String, Observation<String>>,
+        workers: &BTreeMap<String, String>,
+    ) -> Result<Step, StoreError> {
+        let ctl = ForgeController;
+        let mut input = ForgeInput {
+            task: obj,
+            observations: ForgeObservations {
+                workers: workers.clone(),
+                ..ForgeObservations::default()
+            },
+            now: self.clock.now(),
+            defaults: self.forge_defaults,
+        };
+        // Each round answers what the last one asked; the controller asks
+        // only for what it lacks, so this ends. The bound is a guard.
+        for _ in 0..4 {
+            let probes = ctl.probes(&input)?;
+            if probes.is_empty() {
+                break;
+            }
+            for probe in probes {
+                match probe {
+                    Probe::Object { kind, name } => {
+                        let o = self.store.get(&kind, &name);
+                        if let Some(why) = o.why() {
+                            report
+                                .unknowns
+                                .push(format!("{} object {kind}/{name}: {why}", obj.key()));
+                        }
+                        input.observations.changes.insert(name, o);
+                    }
+                    Probe::Whoami { host } => {
+                        let answer = match whoami.get(&host) {
+                            Some(a) => a.clone(),
+                            None => {
+                                let Some(forge) = self.forge else {
+                                    return Err(StoreError::Invalid(
+                                        "no [forge] section is configured; a declared change cannot be followed"
+                                            .into(),
+                                    ));
+                                };
+                                *lease = self.store.renew_lease(lease, ttl)?;
+                                let a = forge.whoami(&host);
+                                whoami.insert(host.clone(), a.clone());
+                                a
+                            }
+                        };
+                        if let Some(why) = answer.why() {
+                            report
+                                .unknowns
+                                .push(format!("{} whoami {host}: {why}", obj.key()));
+                        }
+                        input.observations.whoami.insert(host, answer);
+                    }
+                    // Not this controller's in this step.
+                    _ => {}
+                }
+            }
+        }
+        let plan = ctl.reconcile(&input)?;
+        let mut step = Step::default();
+        if plan.status.is_none() && plan.appends.is_empty() {
+            return Ok(step);
+        }
+        let forge = plan
+            .status
+            .unwrap_or_else(|| obj.status.get("forge").cloned().unwrap_or(Value::Null));
+        match self.store.record_relay(
+            &obj.metadata.name,
+            forge,
+            plan.appends,
+            obj.metadata.resource_version,
+            ForgeController::MANAGER,
+            lease,
+        ) {
+            Ok(_) => step.wrote += 1,
+            // Someone wrote first, or the key already landed: decide again
+            // from fresh state on the next pass.
+            Err(StoreError::Conflict { .. }) | Err(StoreError::AlreadyExists(_)) => {
+                step.conflict = true;
+            }
+            Err(e) => return Err(e),
         }
         Ok(step)
     }
@@ -578,8 +726,8 @@ impl Manager<'_> {
                 note("atRest", o.why());
                 obs.at_rest = Some(o);
             }
-            // Not a Task's probe: TaskController never asks it.
-            Probe::Change { .. } => {}
+            // Not TaskController's probes: it never asks them.
+            Probe::Change { .. } | Probe::Object { .. } | Probe::Whoami { .. } => {}
         }
     }
 

@@ -1,15 +1,19 @@
-//! The verbs people and workers use: spec writes (`apply`, `delete`) and the
-//! worker's answer (`result`). The CLI calls these and nothing below them, so
-//! every rule lives here once.
+//! The verbs people and workers use: spec writes (`apply`, `delete`), a
+//! person's message (`send`) and the worker's answers (`result`, `declare`).
+//! The CLI calls these and nothing below them, so every rule lives here
+//! once.
 
 use fleet_api::change_request::{self, ChangeRequestSpec};
+use fleet_api::follow::{DECLARED_CHANGE_REQUEST, validate_declaration};
 use fleet_api::forge::{ChangeRef, Forge};
 use fleet_api::inbox::{CLI_SOURCE_PREFIX, InboxEntry, send_key};
+use fleet_api::meta::API_VERSION;
 use fleet_api::result::{TaskResult, validate_outputs};
 use fleet_api::task::{self, TaskSpec, TaskStatus};
 use fleet_api::validate::typed;
 use fleet_api::{Clock, DeleteOutcome, FieldManager, Object, Observation, Store, StoreError};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,30 +151,7 @@ pub fn apply_change_request(
                 Err(e) => return Err(e),
             },
             Observation::Known(Some(current)) => {
-                let recorded: Option<ChangeRef> = match current.status.get("ref") {
-                    Some(v) if !v.is_null() => {
-                        Some(serde_json::from_value(v.clone()).map_err(|e| {
-                            StoreError::Unknown(format!("{}: status.ref: {e}", obj.key()))
-                        })?)
-                    }
-                    _ => None,
-                };
-                let mirrors = match recorded {
-                    Some(r) => r,
-                    None => {
-                        let existing: ChangeRequestSpec =
-                            typed(change_request::KIND, &current.spec)?;
-                        parse_url(forge, &existing.url, &name)?
-                    }
-                };
-                if mirrors != reference {
-                    return Err(StoreError::Forbidden(format!(
-                        "{} mirrors {}, not {}: a change names one object, so give this one another name",
-                        obj.key(),
-                        mirrors.canonical(),
-                        reference.canonical()
-                    )));
-                }
+                verify_mirrors(forge, &current, &reference)?;
                 let rv = current.metadata.resource_version;
                 let labels = Some(obj.metadata.labels.clone());
                 match store.update_spec(
@@ -195,6 +176,199 @@ pub fn apply_change_request(
     Err(StoreError::Busy(format!(
         "{}/{name}: kept conflicting with other writers",
         obj.kind
+    )))
+}
+
+/// An existing ChangeRequest is reused only when it mirrors `reference`:
+/// its recorded `status.ref` once the controller wrote one, else its own
+/// URL parsed again.
+fn verify_mirrors(
+    forge: &dyn Forge,
+    current: &Object,
+    reference: &ChangeRef,
+) -> Result<(), StoreError> {
+    let recorded: Option<ChangeRef> = match current.status.get("ref") {
+        Some(v) if !v.is_null() => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|e| StoreError::Unknown(format!("{}: status.ref: {e}", current.key())))?,
+        ),
+        _ => None,
+    };
+    let mirrors = match recorded {
+        Some(r) => r,
+        None => {
+            let existing: ChangeRequestSpec = typed(change_request::KIND, &current.spec)?;
+            parse_url(forge, &existing.url, &current.metadata.name)?
+        }
+    };
+    if mirrors != *reference {
+        return Err(StoreError::Forbidden(format!(
+            "{} mirrors {}, not {}: a change names one object, so give this one another name",
+            current.key(),
+            mirrors.canonical(),
+            reference.canonical()
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DeclareOutcome {
+    Declared,
+    /// The same fact was already declared: a retry of `fleet declare`.
+    Unchanged,
+}
+
+/// What `fleet declare --change-request` did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub outcome: DeclareOutcome,
+    /// The declaration as appended (or found).
+    pub item: Value,
+    /// The ChangeRequest's name, and whether this verb created it.
+    pub change_request: String,
+    pub created: bool,
+}
+
+/// `fleet declare TASK --change-request URL`: parse the URL through the
+/// Forge port (a host not configured is refused), ensure one ChangeRequest
+/// exists for it under its derived name (an existing one is reused after
+/// its `status.ref` is verified), then append `{kind, url, name}` to the
+/// Task's `status.declared` as field manager `worker`. A repeated URL is a
+/// no-op. The two steps are not atomic: a crash between them leaves a
+/// ChangeRequest nobody follows, which the next `declare` of that URL finds.
+pub fn declare_change_request(
+    store: &dyn Store,
+    forge: &dyn Forge,
+    task_name: &str,
+    url: &str,
+) -> Result<Declared, StoreError> {
+    // Eligibility first, so an ineligible Task creates no orphan.
+    eligible_for_declare(store, task_name)?;
+    let url = url.trim();
+    let reference = match forge.parse(url) {
+        Observation::Known(r) => r,
+        Observation::Unknown { why } => {
+            return Err(StoreError::Invalid(format!("change URL {url:?}: {why}")));
+        }
+    };
+    let name = derived_name(&reference);
+    let mut created = false;
+    for _ in 0..CAS_TRIES {
+        match store.get(change_request::KIND, &name) {
+            Observation::Known(None) => {
+                let manifest = Object {
+                    api_version: API_VERSION.to_string(),
+                    kind: change_request::KIND.to_string(),
+                    metadata: fleet_api::ObjectMeta {
+                        name: name.clone(),
+                        ..fleet_api::ObjectMeta::default()
+                    },
+                    spec: json!({"url": url}),
+                    status: Value::Null,
+                };
+                store.validate(&manifest)?;
+                match store.create(manifest, FieldManager::Apply) {
+                    Ok(_) => {
+                        created = true;
+                        break;
+                    }
+                    Err(StoreError::AlreadyExists(_)) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            Observation::Known(Some(current)) => {
+                verify_mirrors(forge, &current, &reference)?;
+                break;
+            }
+            Observation::Unknown { why } => return Err(StoreError::Unknown(why)),
+        }
+    }
+    let item = json!({"kind": DECLARED_CHANGE_REQUEST, "url": url, "name": name});
+    let outcome = append_declaration(store, task_name, item.clone(), |existing| {
+        existing.get("kind").and_then(Value::as_str) == Some(DECLARED_CHANGE_REQUEST)
+            && existing.get("name").and_then(Value::as_str) == Some(name.as_str())
+    })?;
+    Ok(Declared {
+        outcome,
+        item,
+        change_request: name,
+        created,
+    })
+}
+
+/// `fleet declare TASK --json OBJECT`: append any JSON object with a string
+/// `kind` to `status.declared`; Fleet validates nothing else. The same
+/// object again is a no-op.
+pub fn declare(
+    store: &dyn Store,
+    task_name: &str,
+    item: Value,
+) -> Result<DeclareOutcome, StoreError> {
+    validate_declaration(&item).map_err(StoreError::Invalid)?;
+    append_declaration(store, task_name, item.clone(), |existing| *existing == item)
+}
+
+/// Both forms are accepted after the brief has a receipt and before
+/// deletion, and conclude nothing.
+fn eligible_for_declare(store: &dyn Store, name: &str) -> Result<(Object, TaskStatus), StoreError> {
+    let obj = match store.get(task::KIND, name) {
+        Observation::Known(Some(o)) => o,
+        Observation::Known(None) => {
+            return Err(StoreError::NotFound(format!("{}/{name}", task::KIND)));
+        }
+        Observation::Unknown { why } => return Err(StoreError::Unknown(why)),
+    };
+    if obj.is_deleting() {
+        return Err(StoreError::Forbidden(format!(
+            "{} is being deleted",
+            obj.key()
+        )));
+    }
+    let st: TaskStatus = if obj.status.is_null() {
+        TaskStatus::default()
+    } else {
+        typed(task::KIND, &obj.status)?
+    };
+    if st.brief.is_none() {
+        return Err(StoreError::Forbidden(format!(
+            "{}: no brief has a receipt yet; a declaration comes from a briefed worker",
+            obj.key()
+        )));
+    }
+    Ok((obj, st))
+}
+
+fn append_declaration(
+    store: &dyn Store,
+    name: &str,
+    item: Value,
+    same: impl Fn(&Value) -> bool,
+) -> Result<DeclareOutcome, StoreError> {
+    for _ in 0..CAS_TRIES {
+        let (obj, mut st) = eligible_for_declare(store, name)?;
+        if st.declared.iter().any(&same) {
+            return Ok(DeclareOutcome::Unchanged);
+        }
+        st.declared.push(item.clone());
+        let status = serde_json::to_value(&st).map_err(|e| StoreError::Invalid(e.to_string()))?;
+        match store.update_status(
+            task::KIND,
+            name,
+            status,
+            obj.metadata.resource_version,
+            FieldManager::Worker,
+            None,
+        ) {
+            Ok(_) => return Ok(DeclareOutcome::Declared),
+            Err(StoreError::Conflict { .. }) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(StoreError::Busy(format!(
+        "{}/{name}: kept conflicting with other writers",
+        task::KIND
     )))
 }
 

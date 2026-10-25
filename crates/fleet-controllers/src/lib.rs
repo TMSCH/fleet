@@ -4,6 +4,8 @@
 //!
 //! - [`TaskController`] runs one agent session for one brief.
 //! - [`ChangeRequestController`] mirrors one change on a forge.
+//! - [`ForgeController`] follows the changes a Task's worker declared and
+//!   relays what is new into the Task's inbox.
 //!
 //! Adapters sit above this crate and are unreachable from it, which the
 //! compiler enforces:
@@ -36,13 +38,16 @@
 //! The positive control: the port types it decides over are in scope.
 //!
 //! ```
-//! use fleet_controllers::{ChangeRequestController, TaskController};
+//! use fleet_controllers::{ChangeRequestController, ForgeController, TaskController};
 //! assert_eq!(TaskController::KIND, "Task");
 //! assert_eq!(ChangeRequestController::KIND, "ChangeRequest");
+//! assert_eq!(ForgeController::KIND, "Task");
 //! ```
 
 pub mod change_request;
+pub mod forge;
 pub mod task;
 
 pub use change_request::{ChangeRequestController, ChangeRequestInput, ChangeRequestObservations};
+pub use forge::{ForgeController, ForgeInput, ForgeObservations};
 pub use task::{MAX_ATTEMPTS, RETRY_DELAY_MS, TaskController, TaskInput};

@@ -133,8 +133,8 @@ pub fn validate_spec(kind: &str, spec: &Value) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// A Task's spec is fixed once created, like a Pod's: only `dispatch` may
-/// change. A different brief is a different Task.
+/// A Task's spec is fixed once created, like a Pod's: only `dispatch` and
+/// `forge` may change. A different brief is a different Task.
 pub fn validate_spec_update(kind: &str, old: &Value, new: &Value) -> Result<(), StoreError> {
     validate_spec(kind, new)?;
     if kind == change_request::KIND {
@@ -162,9 +162,10 @@ pub fn validate_spec_update(kind: &str, old: &Value, new: &Value) -> Result<(), 
         }
     }
     a.dispatch = b.dispatch;
+    a.forge = b.forge.clone();
     if a != b {
         return Err(StoreError::Invalid(
-            "Task spec is immutable except spec.dispatch; create a new Task for a different brief"
+            "Task spec is immutable except spec.dispatch and spec.forge; create a new Task for a different brief"
                 .into(),
         ));
     }
@@ -184,9 +185,12 @@ pub fn validate_status(kind: &str, status: &Value) -> Result<(), StoreError> {
     }
     validate_kind(kind)?;
     match kind {
-        task::KIND => serde_json::from_value::<task::TaskStatus>(status.clone())
-            .map(|_| ())
-            .map_err(|e| StoreError::Invalid(format!("Task status: {e}"))),
+        task::KIND => {
+            let st: task::TaskStatus = serde_json::from_value(status.clone())
+                .map_err(|e| StoreError::Invalid(format!("Task status: {e}")))?;
+            crate::follow::validate_declared(&st.declared)
+                .map_err(|why| StoreError::Invalid(format!("Task status: {why}")))
+        }
         change_request::KIND => {
             serde_json::from_value::<change_request::ChangeRequestStatus>(status.clone())
                 .map(|_| ())

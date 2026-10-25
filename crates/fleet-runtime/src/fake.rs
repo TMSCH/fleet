@@ -84,6 +84,9 @@ pub struct FakeSession {
     pub at_rest: bool,
     /// Intent keys of every brief delivered, in order.
     pub briefs: Vec<String>,
+    /// The text of each, in the same order, for tests to read back.
+    #[serde(default)]
+    pub texts: Vec<String>,
     /// Set when the session vanished or was deleted.
     pub gone: bool,
     /// Set once the Task released (deleted) it.
@@ -380,6 +383,7 @@ impl Runtime for FakeRuntime {
                 ready: !s.spawn_not_ready,
                 at_rest: false,
                 briefs: Vec::new(),
+                texts: Vec::new(),
                 gone: false,
                 released: false,
             };
@@ -416,6 +420,7 @@ impl Runtime for FakeRuntime {
         intent_key: &str,
     ) -> Observation<EffectOutcome> {
         let (key, intent, len) = (session.key.clone(), intent_key.to_string(), text.len());
+        let text = text.to_string();
         self.effect("brief", move |s| {
             let Some(x) = s.sessions.get_mut(&key).filter(|x| !x.gone) else {
                 return EffectOutcome::Failed {
@@ -426,6 +431,7 @@ impl Runtime for FakeRuntime {
                 return EffectOutcome::Delivered { already: true };
             }
             x.briefs.push(intent.clone());
+            x.texts.push(text);
             x.at_rest = false;
             s.log.push(format!("brief {key} {intent} ({len} bytes)"));
             EffectOutcome::Delivered { already: false }

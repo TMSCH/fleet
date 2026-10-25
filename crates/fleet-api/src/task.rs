@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::condition::Condition;
+use crate::follow::{ForgeSpec, ForgeStatus};
 use crate::inbox::{Deliveries, DeliveryAttempt, InboxEntry};
 use crate::meta::Millis;
 use crate::plan::{Intent, Receipt};
@@ -20,7 +21,8 @@ pub const RELEASE_FINALIZER: &str = "fleet.dev/release";
 pub const LOCAL_HOST: &str = "local";
 
 /// What a Task asks for. Fixed once created, like a Pod's spec: only
-/// `dispatch` may change, and a different brief is a different Task.
+/// `dispatch` and `forge` may change, and a different brief is a different
+/// Task.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskSpec {
@@ -46,6 +48,10 @@ pub struct TaskSpec {
     /// The structured outputs a worker's result must carry, by name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub outputs: BTreeMap<String, OutputDecl>,
+    /// Overrides of the `[forge]` relay and draft defaults for the changes
+    /// this Task's worker declares; mutable like `dispatch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeSpec>,
 }
 
 fn local_host() -> String {
@@ -70,10 +76,11 @@ pub enum Phase {
     Releasing,
 }
 
-/// Task status. TaskController owns every field but `result`, which the
-/// worker writes through `fleet result`, and `inbox`, which nobody owns: it
-/// is reached only through the store's typed append and record-and-remove
-/// mutations (see [`crate::inbox`]).
+/// Task status. TaskController owns every field but `result` and
+/// `declared`, which the worker writes through `fleet result` and `fleet
+/// declare`, `forge`, which ForgeController owns, and `inbox`, which nobody
+/// owns: it is reached only through the store's typed append and
+/// record-and-remove mutations (see [`crate::inbox`]).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TaskStatus {
@@ -123,6 +130,14 @@ pub struct TaskStatus {
     /// TaskController's sends and probes per inbox entry being delivered.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub delivery_attempts: BTreeMap<String, DeliveryAttempt>,
+    /// Facts the worker declared through `fleet declare`, each a JSON
+    /// object with a string `kind`; field manager `worker`'s.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared: Vec<serde_json::Value>,
+    /// The Forge controller's: one entry per followed change and its
+    /// conditions. Absent for a Task that declared nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forge: Option<ForgeStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,10 +161,13 @@ pub struct SessionRef {
 }
 
 /// The status fields the worker owns.
-pub const WORKER_FIELDS: &[&str] = &["result"];
+pub const WORKER_FIELDS: &[&str] = &["result", "declared"];
+
+/// The status fields ForgeController owns.
+pub const FORGE_FIELDS: &[&str] = &["forge"];
 
 /// The status fields nobody owns: reached only through typed mutations.
-/// Every field in neither list is TaskController's.
+/// Every field in none of these lists is TaskController's.
 pub const UNOWNED_FIELDS: &[&str] = &["inbox"];
 
 /// The session key for a Task: deterministic, so a second spawn finds the

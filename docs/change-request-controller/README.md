@@ -16,8 +16,8 @@ from here.
 
 ## One run
 
-1. A ChangeRequest is applied, by a person or, in a later step, by
-   `fleet declare` for the change a worker opened. The adapter for its host
+1. A ChangeRequest is applied, by a person or by `fleet declare` for the
+   change a worker opened. The adapter for its host
    parses the URL at apply, and again before the first poll, when the
    controller records it as `status.ref`.
 2. On each due pass the controller asks one probe, `Change { ref }`. The

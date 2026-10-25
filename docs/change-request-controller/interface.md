@@ -71,7 +71,7 @@ the manager runs on, with that machine's CLI logins.
 | `parse` | A URL | The `ChangeRef` for it, normalised, using the adapter `[forge.hosts]` names for the host. Unknown for a host not configured. |
 | `whoami` | A host | Fleet's login on that host, or Unknown. |
 | `change` | A `ChangeRef` | `Some(ChangeSnapshot)`, complete; `None` for proven absence; Unknown on timeout, an incomplete read, a throttled answer or an unreadable answer, with `retryAfter` when the forge gave one. |
-| `mark_ready` | A `ChangeRef`, the expected `head.id` and state, and an intent key | `Done { already }`, or Failed when the change is no longer the expected head or state, or Failed/Unknown otherwise. Used by the [Forge controller](../forge-controller/interface.md) only, a later step: the port carries the method now, with a default that answers `Failed`, so that step changes no port. |
+| `mark_ready` | A `ChangeRef`, the expected `head.id` and state, and an intent key | `Done { already }`, or Failed when the change is no longer the expected head or state, or Failed/Unknown otherwise. Used by the [Forge controller](../forge-controller/interface.md)'s mark-ready step only, still to come: the port carries the method now, with a default that answers `Failed`, so that step changes no port. |
 
 The port has no merge method.
 
@@ -95,12 +95,12 @@ six bounded calls, each of `forge.callTimeoutMs`; the port's
   head. A `Retry-After` or rate-limit reset header becomes `retryAfter`. A
   head with more than 100 checks or a thread with more than 100 comments is
   Unknown, never a partial read. `mark_ready` (the ready-for-review mutation
-  after a fresh read) is a later step.
+  after a fresh read) is the mark-ready step's.
 - **gitlab:** bounded `glab api --hostname <host> --include` processes read
   the merge request, its discussions with pagination, its approvals,
   `detailed_merge_status` and the head pipeline. A 404 of the merge request
-  is proven absence only when the project itself answers. `mark_ready` is a
-  later step.
+  is proven absence only when the project itself answers. `mark_ready` is
+  the mark-ready step's.
 - **fake:** a file-backed forge for tests and trials, with injectable faults
   (lost answers, timeouts, throttling with `retryAfter`, incomplete reads,
   malformed answers, proven absence). It runs no process. Its URLs take any
@@ -156,7 +156,7 @@ an error and polls nothing.
 | Writer | May change | Required fencing |
 | --- | --- | --- |
 | `apply` | New ChangeRequest and labels; request deletion | Store validation, exclusive creation. |
-| `declare` (later step) | A new ChangeRequest named from the canonical ref, on a Task's behalf | Exclusive creation; an existing object is reused unchanged after its `status.ref` is verified against the URL. |
+| `declare` | A new ChangeRequest named from the canonical ref, on a Task's behalf | Exclusive creation; an existing object is reused unchanged after its `status.ref` is verified against the URL. |
 | `change-request-controller` | All of `status`; deletion of its own object after retention | Current resourceVersion, the object's `uid` and the live manager lease. |
 
 The spec is immutable: any change to it is refused. `ownerReferences` is

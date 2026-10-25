@@ -15,7 +15,7 @@ v1's queue records, extension or operator configuration, and the root
 
 | Kind | Role | Status written by |
 | --- | --- | --- |
-| `Task` | one agent session doing one brief | TaskController; the worker writes `status.result` |
+| `Task` | one agent session doing one brief | TaskController; the worker writes `status.result` and `status.declared`; ForgeController writes `status.forge` |
 | `TaskConfig` | reusable execution defaults | nobody (passive data) |
 | `EnvProvider` | stored data and explicit file/command environment sources | nobody (passive data) |
 | `ChangeRequest` | one mirrored change on a forge | ChangeRequestController |
@@ -24,19 +24,19 @@ Unrecognized kinds are refused on write as `unknown kind "X"`. A Task spec
 accepts the fields below (`deny_unknown_fields`), and no object may carry
 `ownerReferences`.
 
-The [Forge controller](../docs/forge-controller/README.md), a second
-controller over the Task, is designed and not served. One piece of that
-design is served already: the Task's inbox, a status field with no single
-owner, `status.inbox`, reached only through the two typed mutations under
-[Store](#store), which refuse a duplicate key. `fleet send` appends to it
-and TaskController delivers it; the Forge controller becomes a second named
-caller of the append.
+The [Forge controller](../docs/forge-controller/README.md) is a second
+controller over the Task: it follows the changes a worker declared and
+relays their feedback into the Task's inbox, a status field with no single
+owner, `status.inbox`, reached only through the typed mutations under
+[Store](#store), which refuse a duplicate key. `fleet send` and the Forge
+controller append to it and TaskController delivers it. The Forge
+controller's mark-ready step is designed and not served.
 
 ## Crates and the allowed graph
 
 ```text
 fleet-api          pure           types and ports
-fleet-controllers  pure           TaskController         -> api
+fleet-controllers  pure           the three controllers  -> api
 fleet-exec         adapter        the one process spawner
 fleet-store        adapter        file store             -> api
 fleet-runtime      adapter        thurbox-cli, fake      -> api, exec
@@ -58,10 +58,11 @@ fleet-dev          tooling        `cargo xtask`: gate and release
 - No crate reaches another crate it may not depend on through a third
   crate's re-export.
 - Only the crates listed may name a status-writing field manager: only
-  fleet-controllers names `FieldManager::TaskController` and
-  `FieldManager::ChangeRequestController`, and only fleet-manager's `send`
-  verb (and the store that checks it) names `FieldManager::Cli`, the caller
-  of the inbox append.
+  fleet-controllers names `FieldManager::TaskController`,
+  `FieldManager::ChangeRequestController` and `FieldManager::ForgeController`,
+  only fleet-manager's `result` and `declare` verbs name `FieldManager::Worker`,
+  and only fleet-manager's `send` verb (and the store that checks it) names
+  `FieldManager::Cli`, the caller of the inbox append.
 - The CLI calls no store write, no controller method, no runtime effect and
   no forge read: it parses, calls a fleet-manager verb, and prints.
 - Only fleet-exec reaches `std::process::Command`, `std::os::unix::process`,
@@ -88,11 +89,12 @@ spec.brief          the brief, sent once
 spec.workspace.dir  the session's working directory
 spec.dispatch       nothing spawns while false
 spec.outputs        optional: the structured outputs a result must carry
+spec.forge          optional: relay and draft overrides for declared changes
 ```
 
-The spec is immutable once created, except `dispatch`; a different brief is a
-different Task. `harness` and `host` may not start with `-`, since both reach
-the runtime as arguments.
+The spec is immutable once created, except `dispatch` and `forge`; a
+different brief is a different Task. `harness` and `host` may not start
+with `-`, since both reach the runtime as arguments.
 
 See [execution configuration](../docs/resources/task-config.md) for
 reference validation, deterministic precedence and private launch freezing.
@@ -161,6 +163,58 @@ Guarantees, each with its test:
 
 Conditions: `HostReachable`, `Spawned`, `Briefed`, `Stalled`, `WorkerGone`,
 `Concluded`, `Released`, `NeedsAttention`.
+
+## Following declared changes
+
+ForgeController is a pure function from the Task, the ChangeRequests its
+worker declared and Fleet's login on their hosts to a plan: the desired
+`status.forge` and the inbox entries to land with it. It has no effect in
+this step and no finalizer, and never writes a ChangeRequest. Guarantees,
+each with its test in `forge_controller` and `e2e_forge_controller`:
+
+- **Declare.** `fleet declare TASK --change-request URL` parses the URL
+  through the Forge port, ensures one ChangeRequest under the derived name
+  (an existing one is reused after its `status.ref`, else its own URL, is
+  verified) and appends `{kind, url, name}` to `status.declared` as
+  `worker`, with CAS; a repeated URL is a no-op. `--json OBJECT` appends any
+  object with a string `kind`. Both need a brief receipt and refuse a
+  deleting Task, and an ineligible Task creates no orphan; a crash between
+  the two steps leaves a ChangeRequest nobody follows, which the next
+  `declare` of that URL finds.
+- **Join at the present.** A declaration whose object is Known with a `ref`
+  gets an entry with the object's `uid` and `cursor = revision`, and one
+  message holding the whole snapshot, under
+  `task/<name>/<uid>/relay/<change uid>/<revision>` from `forge/<name>`;
+  when the mirror has already dropped notes, the message says older notes
+  exist on the forge. An object without a `ref` yet, or Unknown, waits;
+  readable absence raises `NeedsAttention/ChangeGone`.
+- **Relay by cursor.** Every note with `seq` above the cursor that passes the
+  filters (never this Task's own marked words; bots only per `relayBots`;
+  never a resolved thread or one this Task already answered in) and every
+  transition of state, review decision or passed/failed checks above it
+  become one entry, with `about` naming the mirror's `uid`, `revision` and
+  head; the cursor advances in the same write, whether or not anything was
+  sent. Another worker's marked note is relayed and labelled with its Task.
+  `spec.forge.relay.notes` and `.checks` stop each kind on its own.
+- **Gaps.** `droppedBefore` above the cursor relays a gap notice with the
+  whole retained snapshot, counts `gaps` and raises `NeedsAttention/RelayGap`
+  until the next relay that carries something.
+- **Attribution first.** An Unknown login on the change's host skips the
+  entry this pass: nothing is relayed that could not be filtered.
+- **Rebind.** A different `uid` under the same name is a new incarnation:
+  the entry takes it, resets its cursor and mark-ready record, and joins
+  again; the delivered-revision guard is per mirror `uid`, so the new join
+  is not refused as a repeat.
+- **Settled.** An entry whose ChangeRequest settled is relayed one last time
+  and read no more; a Concluded Task is still relayed to; a deleted Task
+  leaves every ChangeRequest alone.
+- **One write.** The cursor and the entries land through `record_relay`, or
+  not at all: a duplicate key or a stale version refuses the whole write.
+
+Conditions, under `status.forge.conditions`: `Following`, `Settled`,
+`NeedsAttention` (`RelayGap`, `ChangeGone`). The mark-ready effect, the
+`AtRest` probe and the ready policies are the next step's; `markReady` and
+`spec.forge.draft.policy` are stored untouched for it.
 
 ## ChangeRequest
 
@@ -231,16 +285,21 @@ refused.
   `Task.status.inbox`, which has none and which no status write may change.
   A controller writes only under the current manager lease: an expired or
   superseded token is refused, and the token only grows.
-- `status.inbox` is reached through two typed mutations, each named by its
-  caller and compare-and-swap under the lock: `append_inbox` (`cli`, through
-  the manager's `send` verb; no lease) refuses a key already in `inbox` or
-  `deliveries`, an `about.revision` at or below the source's highest
-  delivered one, an append while more than 20 entries are undelivered, and a
-  deleting Task; `record_delivery` (TaskController, under the lease) writes
-  the controller's status and, in the same write, the receipt into the
-  newest-100 `status.deliveries` and the entry out of `inbox`, refusing a key
-  no entry holds. Neither changes another field; `store_contract` races
-  appenders against the remover and tears the record.
+- `status.inbox` is reached through three typed mutations, each named by
+  its caller and compare-and-swap under the lock: `append_inbox` (`cli`,
+  through the manager's `send` verb, no lease; or `forge-controller`, under
+  the lease) refuses a key already in `inbox` or `deliveries`, an
+  `about.revision` at or below the mirror's (`about.uid`) highest delivered
+  one, an append while more than 20 entries are undelivered, a deleting
+  Task, and a source not under the caller's prefix (`cli/`, `forge/`);
+  `record_relay` (ForgeController, under the lease) replaces `status.forge`
+  and appends each listed entry under the same checks, in one write that a
+  single refused entry fails whole; `record_delivery` (TaskController,
+  under the lease) writes the controller's status and, in the same write,
+  the receipt into the newest-100 `status.deliveries` and the entry out of
+  `inbox`, refusing a key no entry holds. None changes another field;
+  `store_contract` races appenders against the remover and tears the
+  record.
 - Deleting marks a Task while its finalizer remains; only its controller,
   holding the lease, removes the finalizer, and only from a deleting Task.
 - A controller deletes its own object (`delete_fenced`) only with the
@@ -292,7 +351,7 @@ Credentials stay with each CLI's own login; Fleet passes none and stores none.
 
 ## The command line
 
-`fleet init|up|apply|get|list|status|send|result|delete|reconcile|version`.
+`fleet init|up|apply|get|list|status|send|declare|result|delete|reconcile|version`.
 Exit codes:
 0 ok, 1 refused, 2 usage, 3 not found, 4 Unknown, 5 conflict, 6 lease.
 `apply`, `get`, `list`, `status` and `delete` take `changerequest` as well as
@@ -371,7 +430,9 @@ The `e2e_*` suites drive the real `fleet` binary against an isolated store,
 the fake host or a stub `thurbox-cli`, and, for `e2e_forge`, the fake forge
 or the same stub copied as `gh` and `glab`, across process restarts and
 injected faults; `e2e_inbox` covers `fleet send` and delivery on both the
-fake host and the stub. `task_controller` and `change_request_controller`
-test each controller as a pure function, one transition or Unknown per case.
+fake host and the stub; `e2e_forge_controller` covers `fleet declare`, the
+join and the relay against the fake forge and the fake host.
+`task_controller`, `change_request_controller` and `forge_controller` test
+each controller as a pure function, one transition or Unknown per case.
 `store_contract` tests the store against races, torn writes, stale leases
 and the fenced delete. The `architecture` suite enforces the graph above.

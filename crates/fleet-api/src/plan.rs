@@ -27,6 +27,10 @@ pub struct Plan {
     /// `status.deliveries` and the entry leaves `status.inbox` in the same
     /// write as `status`, through the store's record-and-remove mutation.
     pub delivery: Option<crate::inbox::DeliveryReceipt>,
+    /// Inbox entries to append in the same write as `status`, through the
+    /// store's relay mutation. Only ForgeController asks, and its `status`
+    /// is then `status.forge` alone.
+    pub appends: Vec<crate::inbox::InboxEntry>,
 }
 
 /// An effect outside the store, under a deterministic key: a key that has a
@@ -140,6 +144,19 @@ pub enum Probe {
     /// One complete observation of a change, through the Forge port.
     Change {
         change: ChangeRef,
+    },
+    /// A stored object, answered by the manager from the store: `Known(Some)`,
+    /// `Known(None)` for proven absence, Unknown when the record is
+    /// unreadable. Needs no lease renewal and runs before any runtime or
+    /// forge probe.
+    Object {
+        kind: String,
+        name: String,
+    },
+    /// Fleet's own login on a forge host, through the Forge port; cached by
+    /// the manager for the sweep.
+    Whoami {
+        host: String,
     },
 }
 

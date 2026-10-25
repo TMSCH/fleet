@@ -174,14 +174,15 @@ object sees readable absence and, if the change is declared again, a new
 
 ```sh
 fleet apply -f change-request.json            # start mirroring a change
-fleet declare fix-314 --change-request URL    # the same, on a Task's behalf (planned)
+fleet declare fix-314 --change-request URL    # the same, on a Task's behalf
 fleet status changerequest cr-5e1c0a9b7f23 --json   # phase, ref, and the whole snapshot
 fleet get changerequest cr-5e1c0a9b7f23       # the stored object
 fleet list changerequests                     # one line per mirror
 fleet delete changerequest cr-5e1c0a9b7f23    # nothing on the forge changes
 ```
 
-`fleet declare` belongs to the Forge controller, a later step; the other
-commands are served. [examples/change-request.json](../../examples/change-request.json)
+`fleet declare` is the [Forge controller](../forge-controller/README.md)'s
+verb: it ensures the mirror and records the declaration on the Task.
+[examples/change-request.json](../../examples/change-request.json)
 is a manifest the shipped [example config](../../examples/fleet.toml) applies
 against the fake forge, offline.

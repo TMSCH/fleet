@@ -154,6 +154,7 @@ impl TaskController {
             remove_finalizer: r.remove_finalizer,
             delete: false,
             delivery: r.delivery,
+            appends: Vec::new(),
         })
     }
 }
