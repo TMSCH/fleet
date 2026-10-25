@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use fleet_api::inbox::{CLI_SOURCE_PREFIX, DeliveryReceipt, InboxEntry};
+use fleet_api::follow::ForgeStatus;
+use fleet_api::inbox::{DeliveryReceipt, InboxEntry};
 use fleet_api::kinds;
 use fleet_api::task::{self, TaskStatus};
 use fleet_api::validate::{
@@ -401,6 +402,22 @@ fn encode_status(st: &TaskStatus) -> Result<Value, StoreError> {
     serde_json::to_value(st).map_err(|e| StoreError::Invalid(format!("Task status: {e}")))
 }
 
+/// Each inbox appender names its source with its own prefix: `cli/<user>`
+/// for `fleet send`, `forge/<change>` for the Forge controller.
+fn check_source(by: FieldManager, entry: &InboxEntry) -> Result<(), StoreError> {
+    let Some(prefix) = kinds::inbox_source_prefix(by) else {
+        return Ok(());
+    };
+    if !entry.from.starts_with(prefix) || entry.from.len() == prefix.len() {
+        return Err(StoreError::Invalid(format!(
+            "an entry {} appends names its source as {prefix}<name>, not {:?}",
+            by.name(),
+            entry.from
+        )));
+    }
+    Ok(())
+}
+
 /// A refused append: a repeated key is `AlreadyExists`, the rest Forbidden.
 fn inbox_refusal(obj: &Object, why: String) -> StoreError {
     if why.ends_with("already exists") {
@@ -684,13 +701,7 @@ impl Store for FileStore {
                 by.name()
             )));
         }
-        if by == FieldManager::Cli && !entry.from.starts_with(CLI_SOURCE_PREFIX) {
-            return Err(StoreError::Invalid(format!(
-                "an entry {} appends names its source as {CLI_SOURCE_PREFIX}<user>, not {:?}",
-                by.name(),
-                entry.from
-            )));
-        }
+        check_source(by, &entry)?;
         let _guard = self.lock()?;
         if by.is_controller() {
             match lease {
@@ -716,6 +727,59 @@ impl Store for FileStore {
             .map_err(|why| inbox_refusal(&obj, why))?;
         st.inbox.push(entry);
         obj.status = encode_status(&st)?;
+        obj.metadata.resource_version = self.next_rv()?;
+        self.write(&obj)?;
+        Ok(obj)
+    }
+
+    fn record_relay(
+        &self,
+        name: &str,
+        forge: Value,
+        appends: Vec<InboxEntry>,
+        expected: u64,
+        by: FieldManager,
+        lease: &LeaseToken,
+    ) -> Result<Object, StoreError> {
+        if !kinds::may_record_relay(by) {
+            return Err(StoreError::Forbidden(format!(
+                "{} does not record relays; only the Forge controller does",
+                by.name()
+            )));
+        }
+        let forge: Option<ForgeStatus> = if forge.is_null() {
+            None
+        } else {
+            Some(
+                serde_json::from_value(forge)
+                    .map_err(|e| StoreError::Invalid(format!("Task status.forge: {e}")))?,
+            )
+        };
+        for entry in &appends {
+            check_source(by, entry)?;
+        }
+        let _guard = self.lock()?;
+        self.check_lease(lease)?;
+        let mut obj = self.read_existing(task::KIND, name)?;
+        expect_rv(&obj, expected)?;
+        if obj.is_deleting() {
+            return Err(StoreError::Forbidden(format!(
+                "{} is being deleted; nothing of the Forge controller's remains to write",
+                obj.key()
+            )));
+        }
+        let mut st = task_status(&obj)?;
+        st.forge = forge.filter(|f| !f.is_empty());
+        for entry in appends {
+            fleet_api::inbox::check_append(&st.inbox, &st.deliveries, &entry)
+                .map_err(|why| inbox_refusal(&obj, why))?;
+            st.inbox.push(entry);
+        }
+        let status = encode_status(&st)?;
+        if obj.status == status {
+            return Ok(obj);
+        }
+        obj.status = status;
         obj.metadata.resource_version = self.next_rv()?;
         self.write(&obj)?;
         Ok(obj)

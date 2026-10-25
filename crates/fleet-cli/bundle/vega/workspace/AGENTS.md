@@ -26,6 +26,12 @@ Read `prompts/mission-control.md` when this session starts. Load
   shared content. Never put secrets in Task briefs, artifacts or committed files.
 - Do not give time, effort or completion estimates. Prefer a small diagram when
   it explains relationships better than prose.
+- Put these three rules in every brief whose worker opens a change on a forge,
+  and keep them yourself: open every change as a draft; declare it with
+  `fleet declare TASK --change-request URL` the moment it is opened; end every
+  post on it with `<!-- fleet:worker <task uid> -->` on its own line, the uid
+  from `fleet get task TASK`. Fleet follows only a declared change, never marks
+  ready a change opened ready, and relays an unmarked post back as feedback.
 
 ## Local customization
 

@@ -782,3 +782,104 @@ fn runtime_effect_capability_cannot_leak_to_an_observer_adapter() {
         &[],
     );
 }
+
+/// The Forge controller's rules, against the real rules file: its field
+/// manager is named by the API and the controllers alone, and the relay
+/// write and the login read are the manager's, never the CLI's.
+#[test]
+fn the_rules_keep_the_forge_controllers_writes_in_the_controllers() {
+    let rules = load_rules(&repo_root().join("crates").join("architecture.toml")).expect("rules");
+    assert_eq!(
+        rules
+            .status_writers
+            .get("fleet_api::store::FieldManager::ForgeController"),
+        Some(&vec![
+            "fleet-api".to_string(),
+            "fleet-controllers".to_string()
+        ])
+    );
+    assert_eq!(
+        rules
+            .status_writers
+            .get("fleet_api::store::FieldManager::Worker"),
+        Some(&vec!["fleet-api".to_string(), "fleet-manager".to_string()]),
+        "declare, like result, is the manager's verb"
+    );
+    let cli = &rules.crates["fleet-cli"];
+    for method in ["record_relay", "whoami", "append_inbox"] {
+        assert!(
+            cli.forbidden_methods.iter().any(|m| m == method),
+            "the CLI may not call {method}"
+        );
+    }
+}
+
+/// A third controller over an existing kind is as guarded as the first two:
+/// only the listed crates name its manager, and its typed write is a
+/// manager method the CLI may not call.
+#[test]
+fn a_second_controller_over_one_kind_is_named_by_the_controllers_alone() {
+    let rules = format!(
+        "{}\n[status_writers]\n\"fx_api::store::FieldManager::Ctl\" = [\"fx-api\", \"fx-ctl\"]\n\"fx_api::store::FieldManager::FgCtl\" = [\"fx-api\", \"fx-ctl\"]\n\"fx_api::store::FieldManager::Cli\" = [\"fx-api\", \"fx-mgr\"]\n",
+        RULES
+            .replace(
+                "[status_writers]\n\"fx_api::store::FieldManager::Ctl\" = [\"fx-api\", \"fx-ctl\"]\n\"fx_api::store::FieldManager::Cli\" = [\"fx-api\", \"fx-mgr\"]\n",
+                ""
+            )
+            .replace(
+                "forbidden_methods = [\"update_status\", \"append_inbox\"]",
+                "forbidden_methods = [\"update_status\", \"append_inbox\", \"record_relay\"]"
+            )
+    );
+    let api = "//! ```compile_fail\n//! use fx_store::Store;\n//! ```\npub mod store {\n    pub enum FieldManager { Ctl, FgCtl, Worker, Cli }\n}\npub use store::FieldManager;\nuse serde::Serialize;\n";
+    expect(
+        "forge-writer-clean",
+        &[
+            ("architecture.toml", &rules),
+            ("crates/fx-api/src/lib.rs", api),
+            (
+                CTL,
+                &ctl(
+                    "use fx_api::FieldManager;\npub fn plan() -> FieldManager { FieldManager::Ctl }\npub fn relay() -> FieldManager { FieldManager::FgCtl }\n",
+                ),
+            ),
+        ],
+        &[],
+    );
+    expect(
+        "forge-writer-from-store",
+        &[
+            ("architecture.toml", &rules),
+            ("crates/fx-api/src/lib.rs", api),
+            (
+                "crates/fx-store/src/lib.rs",
+                "pub struct S;\npub fn read() { let _ = fx_api::FieldManager::FgCtl; }\n",
+            ),
+        ],
+        &[("status-writer", "fx-store")],
+    );
+    expect(
+        "forge-writer-from-manager",
+        &[
+            ("architecture.toml", &rules),
+            ("crates/fx-api/src/lib.rs", api),
+            (
+                "crates/fx-mgr/src/lib.rs",
+                "use fx_api::store::FieldManager as F;\npub fn run() { let _ = F::FgCtl; }\n",
+            ),
+        ],
+        &[("status-writer", "fx-mgr")],
+    );
+    expect(
+        "relay-from-cli",
+        &[
+            ("architecture.toml", &rules),
+            ("crates/fx-api/src/lib.rs", api),
+            (
+                "crates/fx-cli/src/main.rs",
+                "fn main() { let s = fx_store::S; s.record_relay(); fx_mgr::run(); }\n",
+            ),
+        ],
+        &[("cli-method", "fx-cli")],
+    );
+}

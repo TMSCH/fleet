@@ -57,9 +57,9 @@ deps = ["fleet-api", "fleet-manager", "fleet-runtime", "fleet-store", "fleet-for
 # Every write is the manager's: the CLI parses, calls a verb, and prints.
 forbidden_methods = [
   "create", "update_spec", "update_status", "append_inbox", "record_delivery",
-  "remove_finalizer", "delete", "delete_fenced", "acquire_lease", "renew_lease",
-  "release_lease", "reconcile", "probes", "spawn", "release", "change",
-  "mark_ready",
+  "record_relay", "remove_finalizer", "delete", "delete_fenced", "acquire_lease",
+  "renew_lease", "release_lease", "reconcile", "probes", "spawn", "release",
+  "change", "mark_ready", "whoami",
 ]
 
 [crates.fleet-arch]
@@ -84,10 +84,13 @@ clippy_guards = [
 
 # Who may name each field manager. Naming one is how code writes as it, and
 # how a caller of the typed inbox mutations names itself: `Cli` appends to
-# `Task.status.inbox` through the manager's `send` verb and owns nothing.
+# `Task.status.inbox` through the manager's `send` verb and owns nothing;
+# `ForgeController` owns `Task.status.forge` and appends through the
+# manager's relay write.
 [status_writers]
 "fleet_api::store::FieldManager::TaskController" = ["fleet-api", "fleet-controllers"]
 "fleet_api::store::FieldManager::ChangeRequestController" = ["fleet-api", "fleet-controllers"]
+"fleet_api::store::FieldManager::ForgeController" = ["fleet-api", "fleet-controllers"]
 "fleet_api::store::FieldManager::Worker" = ["fleet-api", "fleet-manager"]
 "fleet_api::store::FieldManager::Apply" = ["fleet-api", "fleet-manager", "fleet-store"]
 "fleet_api::store::FieldManager::Cli" = ["fleet-api", "fleet-manager", "fleet-store"]

@@ -33,9 +33,11 @@ pub struct StarterConfig {
     pub workspace: PathBuf,
 }
 
-/// The `[forge]` section: the forges ChangeRequests are mirrored from. The
-/// keys of the Forge controller's design (relay, ready policies, the draft
-/// policy) belong to later steps and are refused as unknown until they load.
+/// The `[forge]` section: the forges ChangeRequests are mirrored from, and
+/// the relay defaults a Task's `spec.forge` may override. The mark-ready
+/// keys of the Forge controller's design (`draftPolicy`, `readyPolicies`,
+/// `noCheckGraceMs`) belong to a later step and are refused as unknown until
+/// they load.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ForgeConfig {
@@ -46,6 +48,12 @@ pub struct ForgeConfig {
     /// How long a settled ChangeRequest is retained before its controller
     /// deletes it.
     pub settled_ttl_ms: Option<u64>,
+    /// Relay new notes to the worker (default true).
+    pub relay_notes: Option<bool>,
+    /// Relay passed or failed checks to the worker (default true).
+    pub relay_checks: Option<bool>,
+    /// Relay bot-authored notes to the worker (default false).
+    pub relay_bots: Option<bool>,
     /// One adapter per forge host; a URL on a host not listed is refused.
     #[serde(default)]
     pub hosts: BTreeMap<String, ForgeHostConfig>,

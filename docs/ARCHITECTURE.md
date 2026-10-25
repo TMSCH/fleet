@@ -20,8 +20,8 @@ same sweep as the Task controller, through the Forge port.
 | Crate | Owns | Boundary |
 | --- | --- | --- |
 | [fleet-cli](../crates/fleet-cli/src/main.rs) | Parse arguments, load config, construct adapters, print results | Calls manager verbs; does not write resources or run controller effects directly. |
-| [fleet-manager](../crates/fleet-manager/src/lib.rs) | Reconcile loop, lease renewal, plan execution, apply/delete/result verbs | Reads and writes through `Store`; observes and performs effects through `Runtime`. |
-| [fleet-controllers](../crates/fleet-controllers/src/lib.rs) | Pure Task and ChangeRequest decisions | Receives time and observations as values; returns probes and a plan without I/O. |
+| [fleet-manager](../crates/fleet-manager/src/lib.rs) | Reconcile loop, lease renewal, plan execution, apply/delete/send/result/declare verbs | Reads and writes through `Store`; observes and performs effects through `Runtime`; reads changes and logins through `Forge`. |
+| [fleet-controllers](../crates/fleet-controllers/src/lib.rs) | Pure Task, ChangeRequest and Forge decisions | Receives time and observations as values; returns probes and a plan without I/O. |
 | [fleet-api](../crates/fleet-api/src/lib.rs) | Task, ChangeRequest, plan, observation, result and port types | Pure shared contract; no adapter dependencies. |
 | [fleet-store](../crates/fleet-store/src/lib.rs) | File persistence, CAS, write ownership and lease fencing | A corrupt or unreadable record is Unknown; only proven absence is not-found. |
 | [fleet-runtime](../crates/fleet-runtime/src/lib.rs) | Session operations through thurbox, or the file-backed fake host | Converts external answers to Known/Unknown; retains identity and delivery keys. |
@@ -139,21 +139,27 @@ on `fleet-api` and `fleet-exec`, and the manager a third port. The purity and
 process rules above are unchanged: every forge call is one bounded process
 through `fleet-exec`, and no forge-specific name appears above the port.
 
-### Planned: the Forge controller
+### The Forge controller
 
-Design, not implemented. The [Forge controller](forge-controller/README.md)
-is a second controller over the Task. When a worker declares the change it
-opened, `fleet declare` ensures the ChangeRequest exists, and the controller
-follows it: relays what is new into the Task's inbox by a cursor kept on the
-Task, and takes a draft out of draft under a configured policy. It owns
-`status.forge`, appends to the Task's inbox through the typed store mutation
-`fleet send` already uses, writes nothing else of the Task and no
-ChangeRequest. It never merges. The manager then gains a second controller
-per Task with its own due gate. The Task inbox the relay lands in, its typed
-append and remove mutations on one field with no single owner,
-`status.inbox`, and its delivery by the Task controller are served already
-(see the [Task resource](resources/task.md#inbox)): the write-ownership rule
-has that one typed exception, and every other field keeps one owner.
+The [Forge controller](forge-controller/README.md) is a second controller
+over the Task. When a worker declares the change it opened, `fleet declare`
+ensures the ChangeRequest exists, and the controller follows it: it joins at
+the present with one message holding the whole snapshot, then relays what is
+new into the Task's inbox by a cursor kept on the Task. It owns
+`status.forge` and appends to the Task's inbox through one typed store
+mutation that lands the cursor and the entries together; it writes nothing
+else of the Task and no ChangeRequest, and the relay is a status write, not
+an effect. It never merges. The manager runs it after the Task controller
+on each sweep, under its own due gate, from a fresh read of the Task,
+answering its object probes from the store and its login probe through the
+Forge port. The Task inbox the relay lands in, `status.inbox`, is the one
+field with no single owner: the write-ownership rule has that typed
+exception, and every other field keeps one owner.
+
+Planned, design and not implemented: the mark-ready step, which takes a
+draft out of draft under a configured ready policy. It builds on the
+`markReady` record each entry already carries and on `spec.forge.draft.policy`,
+which is stored today and acted on then.
 
 ## Scope and compatibility
 

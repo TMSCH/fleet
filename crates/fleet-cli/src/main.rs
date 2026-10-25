@@ -12,13 +12,15 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use fleet_api::change_request::ChangeRequestDefaults;
+use fleet_api::follow::ForgeDefaults;
 use fleet_api::forge::Forge;
 use fleet_api::result::{Outcome, TaskResult};
 use fleet_api::runtime::Runtime;
 use fleet_api::{API_VERSION, Object, Observation, Store, StoreError};
 use fleet_forge::{ForgeHosts, HostConfig, HostKind};
 use fleet_manager::{
-    Manager, RunOptions, apply, apply_change_request, delete, record_result, send,
+    DeclareOutcome, Manager, RunOptions, apply, apply_change_request, declare,
+    declare_change_request, delete, record_result, send,
 };
 use fleet_runtime::{FakeHost, FakeRuntime, ThurboxConfig, ThurboxRuntime};
 use fleet_store::{FileStore, SystemClock};
@@ -103,6 +105,16 @@ enum Command {
         /// The whole result as a JSON file instead of the flags above.
         #[arg(long, conflicts_with_all = ["generation", "outcome", "summary", "artifacts", "outputs"])]
         file: Option<PathBuf>,
+    },
+    /// The worker's declaration: the change it opened, or any fact as a JSON object with a `kind`.
+    Declare {
+        task: String,
+        /// The URL of the change the worker opened; one ChangeRequest is ensured for it and followed.
+        #[arg(long, value_name = "URL", conflicts_with = "json")]
+        change_request: Option<String>,
+        /// Any JSON object with a string `kind`, appended as is.
+        #[arg(long, value_name = "OBJECT")]
+        json: Option<String>,
     },
     /// Queue a message for a Task's session; the controller delivers it on its next pass.
     Send {
@@ -321,6 +333,11 @@ fn run(cli: Cli) -> Result<(), Failure> {
             );
             Ok(())
         }
+        Command::Declare {
+            task,
+            change_request,
+            json,
+        } => cmd_declare(store, &config, &task, change_request, json),
         Command::Send { task, text, json } => {
             let entry = send(store, &SystemClock, &task, &current_user(), &text)?;
             if json {
@@ -362,6 +379,7 @@ fn run(cli: Cli) -> Result<(), Failure> {
                 holder,
                 forge: forge.as_ref().map(|f| f as &dyn Forge),
                 change_request_defaults: forge_defaults(&config),
+                forge_defaults: relay_defaults(&config),
             };
             let report = manager.run(RunOptions {
                 max_passes,
@@ -462,6 +480,7 @@ fn cmd_up(
         holder: format!("fleet-up-{}", std::process::id()),
         forge: forge.as_ref().map(|f| f as &dyn Forge),
         change_request_defaults: forge_defaults(config),
+        forge_defaults: relay_defaults(config),
     };
     println!(
         "Task/vega {}: reconciling all Tasks; config {}; Ctrl-C stops Fleet and retains sessions",
@@ -634,6 +653,76 @@ fn forge_defaults(config: &Config) -> ChangeRequestDefaults {
             settled_ttl_ms: f.settled_ttl_ms.unwrap_or(base.settled_ttl_ms),
         },
         None => base,
+    }
+}
+
+/// The relay defaults a Task's `spec.forge` may override.
+fn relay_defaults(config: &Config) -> ForgeDefaults {
+    let base = ForgeDefaults::default();
+    match &config.forge {
+        Some(f) => ForgeDefaults {
+            relay_notes: f.relay_notes.unwrap_or(base.relay_notes),
+            relay_checks: f.relay_checks.unwrap_or(base.relay_checks),
+            relay_bots: f.relay_bots.unwrap_or(base.relay_bots),
+        },
+        None => base,
+    }
+}
+
+/// `fleet declare`: one of the two forms, through the manager's verbs.
+fn cmd_declare(
+    store: &dyn Store,
+    config: &Config,
+    task: &str,
+    change_request: Option<String>,
+    json: Option<String>,
+) -> Result<(), Failure> {
+    match (change_request, json) {
+        (Some(url), None) => {
+            let forge = open_forge(config)?.ok_or_else(|| Failure {
+                code: exit::ERROR,
+                message: "a change needs a [forge] section naming its host".into(),
+                hint: Some("add [forge.hosts] with the change's host to the config file".into()),
+            })?;
+            let declared = declare_change_request(store, &forge, task, &url)?;
+            println!(
+                "Task/{task} declared ChangeRequest/{} ({}; {})",
+                declared.change_request,
+                if declared.created {
+                    "created"
+                } else {
+                    "existing"
+                },
+                if declared.outcome == DeclareOutcome::Declared {
+                    "declared"
+                } else {
+                    "already declared"
+                }
+            );
+            Ok(())
+        }
+        (None, Some(text)) => {
+            let item: Value = serde_json::from_str(&text)
+                .map_err(|e| fail(format!("--json: not a JSON object: {e}")))?;
+            let kind = item
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            let outcome = declare(store, task, item)?;
+            println!(
+                "Task/{task} declared {kind} ({})",
+                if outcome == DeclareOutcome::Declared {
+                    "declared"
+                } else {
+                    "already declared"
+                }
+            );
+            Ok(())
+        }
+        _ => Err(fail(
+            "declare takes exactly one of --change-request URL or --json OBJECT",
+        )),
     }
 }
 
@@ -822,9 +911,16 @@ fn status_summary(obj: &Object) -> Value {
             own.insert(k.to_string(), field(k));
         }
     } else {
-        for k in ["session", "execution", "brief", "result"] {
+        for k in ["session", "execution", "brief", "result", "forge"] {
             own.insert(k.to_string(), field(k));
         }
+        own.insert(
+            "declared".to_string(),
+            obj.status
+                .get("declared")
+                .cloned()
+                .unwrap_or_else(|| json!([])),
+        );
         own.insert(
             "inbox".to_string(),
             obj.status
@@ -891,6 +987,26 @@ fn print_status(s: &Value) {
     let delivered = s["deliveries"]["receipts"].as_array().map_or(0, Vec::len);
     if queued + delivered > 0 {
         println!("inbox {queued} queued, {delivered} delivered");
+    }
+    if let Some(changes) = s["forge"]["changes"].as_object() {
+        for (name, e) in changes {
+            println!(
+                "following {name} {} cursor {} gaps {}",
+                e["state"].as_str().unwrap_or("-"),
+                e["cursor"],
+                e["gaps"]
+            );
+        }
+        for c in s["forge"]["conditions"].as_array().into_iter().flatten() {
+            let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
+            println!(
+                "  forge {:<10} {:<8} {:<26} {}",
+                field("type"),
+                field("status"),
+                field("reason"),
+                field("message").lines().next().unwrap_or("")
+            );
+        }
     }
 }
 

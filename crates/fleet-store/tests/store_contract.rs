@@ -1087,7 +1087,10 @@ fn the_inbox_bound_and_the_delivered_revision_hold_on_append() {
         !st.deliveries.delivered("relay/7"),
         "the oldest rotated out"
     );
-    assert_eq!(st.deliveries.revisions["cli/relay"], 7);
+    assert_eq!(
+        st.deliveries.revisions["c1"], 7,
+        "kept per mirror uid, past the receipt"
+    );
     let err = store2
         .append_inbox(
             "r",
@@ -1377,4 +1380,218 @@ fn a_torn_inbox_write_leaves_the_last_complete_record() {
         &bytes[..bytes.len() / 2],
         "never repaired"
     );
+}
+
+// --- The relay: status.forge and the inbox entries land together. ---------
+
+#[test]
+fn a_relay_lands_the_cursor_and_its_entries_together_or_not_at_all() {
+    use fleet_api::follow::{ChangeEntry, ForgeStatus};
+    let dir = Dir::new("relay");
+    let store = FileStore::open(&dir.0).unwrap();
+    let t = store.create(task("t"), FieldManager::Apply).unwrap();
+    let lease = store.acquire_lease("m", 10_000).unwrap();
+    let relay = |key: &str, revision: u64| InboxEntry {
+        from: "forge/cr-1".into(),
+        about: Some(InboxAbout {
+            uid: "c1".into(),
+            revision,
+            head: Some("abc".into()),
+        }),
+        ..entry(key)
+    };
+    let forge = |cursor: u64| {
+        let mut f = ForgeStatus::default();
+        f.changes
+            .insert("cr-1".into(), ChangeEntry::joined("c1", cursor));
+        serde_json::to_value(f).unwrap()
+    };
+    // Only the Forge controller, under the lease, naming its source.
+    for by in [
+        FieldManager::Apply,
+        FieldManager::Worker,
+        FieldManager::Cli,
+        FieldManager::TaskController,
+        FieldManager::ChangeRequestController,
+    ] {
+        let err = store
+            .record_relay(
+                "t",
+                forge(1),
+                vec![relay("relay/1", 1)],
+                t.metadata.resource_version,
+                by,
+                &lease,
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Forbidden(_)), "{by:?}: {err}");
+    }
+    let mut mislabelled = relay("relay/1", 1);
+    mislabelled.from = "cli/forge".into();
+    assert!(matches!(
+        store.record_relay(
+            "t",
+            forge(1),
+            vec![mislabelled],
+            t.metadata.resource_version,
+            FieldManager::ForgeController,
+            &lease
+        ),
+        Err(StoreError::Invalid(_))
+    ));
+    let stale = fleet_api::LeaseToken {
+        token: lease.token.saturating_sub(1),
+        ..lease.clone()
+    };
+    assert!(matches!(
+        store.record_relay(
+            "t",
+            forge(1),
+            vec![relay("relay/1", 1)],
+            t.metadata.resource_version,
+            FieldManager::ForgeController,
+            &stale
+        ),
+        Err(StoreError::LeaseLost(_))
+    ));
+    let t = store
+        .record_relay(
+            "t",
+            forge(1),
+            vec![relay("relay/1", 1)],
+            t.metadata.resource_version,
+            FieldManager::ForgeController,
+            &lease,
+        )
+        .unwrap();
+    let st = inbox_status(&t);
+    assert_eq!(st.forge.as_ref().unwrap().changes["cr-1"].cursor, 1);
+    assert_eq!(st.inbox.len(), 1);
+
+    // A duplicate key refuses the whole write: the cursor stays where it was.
+    let err = store
+        .record_relay(
+            "t",
+            forge(2),
+            vec![relay("relay/2", 2), relay("relay/1", 1)],
+            t.metadata.resource_version,
+            FieldManager::ForgeController,
+            &lease,
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::AlreadyExists(_)), "{err}");
+    let st = inbox_status(&store.get("Task", "t").known().unwrap().clone().unwrap());
+    assert_eq!(st.forge.as_ref().unwrap().changes["cr-1"].cursor, 1);
+    assert_eq!(st.inbox.len(), 1);
+    // A stale version is a conflict.
+    assert!(matches!(
+        store.record_relay(
+            "t",
+            forge(2),
+            vec![relay("relay/2", 2)],
+            t.metadata.resource_version - 1,
+            FieldManager::ForgeController,
+            &lease
+        ),
+        Err(StoreError::Conflict { .. })
+    ));
+    // The cursor alone, with nothing to append, is a write too.
+    let t = store
+        .record_relay(
+            "t",
+            forge(2),
+            Vec::new(),
+            t.metadata.resource_version,
+            FieldManager::ForgeController,
+            &lease,
+        )
+        .unwrap();
+    assert_eq!(inbox_status(&t).forge.unwrap().changes["cr-1"].cursor, 2);
+
+    // status.forge is the Forge controller's and nobody else's; declared
+    // is the worker's.
+    let mut other = t.status.clone();
+    other["forge"]["changes"]["cr-1"]["cursor"] = json!(9);
+    for (by, lease) in [
+        (FieldManager::TaskController, Some(&lease)),
+        (FieldManager::Worker, None),
+    ] {
+        let err = store
+            .update_status(
+                "Task",
+                "t",
+                other.clone(),
+                t.metadata.resource_version,
+                by,
+                lease,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Forbidden(ref m) if m.contains("status.forge")),
+            "{by:?}: {err}"
+        );
+    }
+    let mut declared = t.status.clone();
+    declared["declared"] = json!([{"kind": "ChangeRequest", "url": "u", "name": "cr-1"}]);
+    let err = store
+        .update_status(
+            "Task",
+            "t",
+            declared.clone(),
+            t.metadata.resource_version,
+            FieldManager::TaskController,
+            Some(&lease),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Forbidden(ref m) if m.contains("status.declared")),
+        "{err}"
+    );
+    let t = store
+        .update_status(
+            "Task",
+            "t",
+            declared,
+            t.metadata.resource_version,
+            FieldManager::Worker,
+            None,
+        )
+        .unwrap();
+    let mut bad = t.status.clone();
+    bad["declared"] = json!([{"url": "no kind"}]);
+    let err = store
+        .update_status(
+            "Task",
+            "t",
+            bad,
+            t.metadata.resource_version,
+            FieldManager::Worker,
+            None,
+        )
+        .unwrap_err();
+    assert!(
+        matches!(err, StoreError::Invalid(ref m) if m.contains("kind")),
+        "{err}"
+    );
+    // The Forge controller may also append alone, under the lease.
+    let t = store
+        .append_inbox(
+            "t",
+            relay("relay/3", 3),
+            t.metadata.resource_version,
+            FieldManager::ForgeController,
+            Some(&lease),
+        )
+        .unwrap();
+    assert_eq!(inbox_status(&t).inbox.len(), 2);
+    assert!(matches!(
+        store.append_inbox(
+            "t",
+            relay("relay/4", 4),
+            t.metadata.resource_version,
+            FieldManager::ForgeController,
+            None
+        ),
+        Err(StoreError::LeaseLost(_))
+    ));
 }

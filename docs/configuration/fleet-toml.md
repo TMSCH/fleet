@@ -143,6 +143,9 @@ one already stored is reported by the manager and never polled.
 callTimeoutMs = 15000
 closedGraceMs = 604800000     # one week; a ChangeRequest spec may override
 settledTtlMs = 2592000000     # thirty days; a ChangeRequest spec may override
+relayNotes = true             # defaults a Task's spec.forge.relay may override
+relayChecks = true
+relayBots = false
 
 [forge.hosts]
 "github.com"         = { kind = "github", cli = "gh" }
@@ -155,6 +158,8 @@ settledTtlMs = 2592000000     # thirty days; a ChangeRequest spec may override
 | `forge.callTimeoutMs` | `15000` | Bound for each forge CLI call. One observation of a change may make up to six such calls, and the manager lease is raised to outlast the port's reported worst case. |
 | `forge.closedGraceMs` | `604800000` | How long a closed change stays watched before it settles. |
 | `forge.settledTtlMs` | `2592000000` | How long a settled ChangeRequest is retained before its controller deletes it. |
+| `forge.relayNotes`, `forge.relayChecks` | `true` | Whether the [Forge controller](../forge-controller/README.md) relays new notes, and passed or failed checks, to a Task's worker. A Task's `spec.forge.relay` overrides each. |
+| `forge.relayBots` | `false` | Whether bot-authored notes are relayed to the worker. |
 | `forge.hosts.<host>` | One per forge host | `kind` is `github`, `gitlab` or `fake`; `cli` is a PATH name or absolute path (`gh` or `glab` by default); a `fake` host takes `dir`, its directory, relative to this file. A URL on a host not listed is refused at apply. |
 
 Credentials stay with each CLI's own login. Fleet passes none to the forge and
@@ -163,16 +168,13 @@ fake host, `forge.example`, so a ChangeRequest can be tried offline.
 
 ### Planned `[forge]` keys
 
-Design, not implemented. The [Forge controller](../forge-controller/README.md)
-design adds the keys below to this section, in later steps. They are refused
-as unknown today, so this example does not load.
+Design, not implemented. The Forge controller's mark-ready step adds the
+keys below to this section. They are refused as unknown today, so this
+example does not load.
 
 ```toml
 [forge]
 noCheckGraceMs = 300000       # the checksPassed predicate's wait for a check
-relayNotes = true             # defaults a Task's spec.forge may override
-relayChecks = true
-relayBots = false
 draftPolicy = "checks"        # omit to never take a draft out of draft
 
 [forge.readyPolicies.checks]
@@ -191,7 +193,5 @@ noUnresolvedThreads = true
 | Field | Required/default | Meaning |
 | --- | --- | --- |
 | `forge.noCheckGraceMs` | `300000` | How long `checksPassed` waits, from a head's first observation, for a check to appear before treating that checkless head as passed. |
-| `forge.relayNotes`, `forge.relayChecks` | `true` | Relay new notes and passed or failed checks to the worker. A Task's `spec.forge.relay` overrides both. |
-| `forge.relayBots` | `false` | Relay bot-authored notes to the worker. |
 | `forge.draftPolicy` | Absent | The ready policy applied to a Task that sets none. Absent: a draft is never taken out of draft unless the Task names a policy. |
 | `forge.readyPolicies.<name>` | Three written by `fleet init` | A set of predicates the [Forge controller](../forge-controller/interface.md#ready-policies) defines, under a name that is only a key; an unknown predicate is refused at load. |

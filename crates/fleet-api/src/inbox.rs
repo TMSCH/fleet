@@ -1,5 +1,5 @@
 //! The Task inbox: messages for a running session, queued by `fleet send`
-//! (and, by design, the Forge controller) and delivered by TaskController
+//! and by the Forge controller, and delivered by TaskController
 //! the way it delivers the brief, oldest first, one per pass, under the
 //! entry's key.
 //!
@@ -30,6 +30,10 @@ pub const MAX_DELIVERIES: usize = 100;
 /// The source prefix of an entry `fleet send` appends: `cli/<user>`.
 pub const CLI_SOURCE_PREFIX: &str = "cli/";
 
+/// The source prefix of an entry the Forge controller appends:
+/// `forge/<change>`, the ChangeRequest's name.
+pub const FORGE_SOURCE_PREFIX: &str = "forge/";
+
 /// One message for the session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -56,8 +60,8 @@ pub struct InboxEntry {
 pub struct InboxAbout {
     /// The ChangeRequest's `uid`.
     pub uid: String,
-    /// The ChangeRequest revision the message covers. Per source, the
-    /// highest delivered one is kept in [`Deliveries::revisions`], so a
+    /// The ChangeRequest revision the message covers. Per mirror (`uid`),
+    /// the highest delivered one is kept in [`Deliveries::revisions`], so a
     /// relay cannot be appended twice even after its receipt rotated out.
     pub revision: u64,
     /// The `head.id` the message was computed from, when the change had one.
@@ -90,7 +94,8 @@ pub struct Deliveries {
     /// The newest [`MAX_DELIVERIES`] receipts, oldest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub receipts: Vec<DeliveryReceipt>,
-    /// Per source, the highest `about.revision` delivered.
+    /// Per mirror (`about.uid`), the highest `about.revision` delivered. A
+    /// mirror recreated after retention has a new `uid` and starts afresh.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub revisions: BTreeMap<String, u64>,
 }
@@ -105,10 +110,10 @@ impl Deliveries {
     }
 
     /// Record one delivery: the receipt in, the oldest out past the cap,
-    /// and the source's revision raised when the entry carried one.
+    /// and the mirror's revision raised when the entry carried one.
     pub fn record(&mut self, entry: &InboxEntry, receipt: DeliveryReceipt) {
         if let Some(about) = &entry.about {
-            let seen = self.revisions.entry(entry.from.clone()).or_default();
+            let seen = self.revisions.entry(about.uid.clone()).or_default();
             *seen = (*seen).max(about.revision);
         }
         self.receipts.push(DeliveryReceipt {
@@ -157,12 +162,12 @@ pub fn check_append(
     if let Some(about) = &entry.about
         && deliveries
             .revisions
-            .get(&entry.from)
+            .get(&about.uid)
             .is_some_and(|seen| *seen >= about.revision)
     {
         return Err(format!(
-            "inbox entry {}: revision {} of {} was already delivered",
-            entry.key, about.revision, entry.from
+            "inbox entry {}: revision {} of {} (mirror {}) was already delivered",
+            entry.key, about.revision, entry.from, about.uid
         ));
     }
     if inbox.len() > MAX_INBOX {
@@ -181,6 +186,14 @@ pub fn send_key(name: &str, uid: &str, n: u64) -> String {
     format!("{base}/{n}")
 }
 
+/// The key of a join or relay: `task/<name>/<uid>/relay/<change uid>/<revision>`.
+/// The mirror's `uid` keeps a recreated mirror's keys apart from its
+/// predecessor's; the revision is the one the message covers.
+pub fn relay_key(name: &str, uid: &str, change_uid: &str, revision: u64) -> String {
+    let base = effect_key(crate::task::KIND, name, uid, "relay", None);
+    format!("{base}/{change_uid}/{revision}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +204,7 @@ mod tests {
             from: from.into(),
             text: "hi".into(),
             about: revision.map(|revision| InboxAbout {
-                uid: "c1".into(),
+                uid: format!("uid-of-{from}"),
                 revision,
                 head: None,
             }),
@@ -230,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn a_source_revision_is_kept_past_its_receipt() {
+    fn a_mirrors_revision_is_kept_past_its_receipt() {
         let mut d = Deliveries::default();
         let relay = entry("r7", "forge/cr-1", Some(7));
         d.record(&relay, receipt("r7", 1));
@@ -245,6 +258,15 @@ mod tests {
         assert!(check_append(&[], &d, &entry("r7b", "forge/cr-1", Some(7))).is_err());
         assert!(check_append(&[], &d, &entry("r8", "forge/cr-1", Some(8))).is_ok());
         assert!(check_append(&[], &d, &entry("o7", "forge/cr-2", Some(7))).is_ok());
+        // The same name with a new mirror uid, after retention, starts afresh.
+        let mut rebound = entry("r1b", "forge/cr-1", Some(1));
+        rebound.about.as_mut().unwrap().uid = "c1-again".into();
+        assert!(check_append(&[], &d, &rebound).is_ok());
+    }
+
+    #[test]
+    fn a_relay_key_names_the_mirror_and_the_revision() {
+        assert_eq!(relay_key("t", "u7", "c3", 9), "task/t/u7/relay/c3/9");
     }
 
     #[test]
